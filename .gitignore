@@ -1,5 +1,6 @@
-node_modules
-npm-debug.log*
+/target
 /data/secrets.json
 /data/blobs
-/data/metadata
+/data/gesh.db
+/data/gesh.db-shm
+/data/gesh.db-wal

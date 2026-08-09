@@ -1,82 +1,155 @@
 # Generic Encrypted Sync Hub (GESH)
 
-A minimal Node.js implementation of the GESH v1 HTTP service for syncing encrypted blobs between devices.
+GESH is a small, self-hostable, zero-knowledge synchronization relay for application state. Clients encrypt their own data and resolve their own domain conflicts; GESH authenticates sync roots, stores opaque immutable event blobs, and provides an incremental event feed for other devices.
+
+> GESH is infrastructure, not a database-as-a-service. The server must never require plaintext application data.
+
+## Status
+
+GESH is under active development. The Rust service is the beginning of the v2 security foundation and is **not yet considered production-ready**.
+
+## Architecture
+
+```text
+client domain state
+      |
+      v
+serialize -> encrypt -> immutable sync event
+                         |
+                         v
+                       GESH
+                    /         \
+             SQLite index   blob store
+```
+
+The current reference server uses:
+
+- Rust + Axum for the HTTP service
+- Tokio for async I/O
+- SQLite via SQLx for durable event metadata and cursors
+- the local filesystem for opaque encrypted blobs
+- a root-secret registry for authentication
+
+The storage layer is intentionally simple today. S3-compatible blob storage and stronger device enrollment/authentication are planned without changing the rule that GESH never receives plaintext application data.
+
+## Security model
+
+GESH assumes clients are responsible for encryption, key management, serialization, conflict resolution, and validation of decrypted application data.
+
+The server is responsible for safely handling hostile network input and protecting stored ciphertext. The Rust implementation therefore starts with several non-negotiable properties:
+
+- protocol identifiers are restricted before they can become filesystem path components
+- root secrets are compared through fixed-length SHA-256 digests using constant-time comparison
+- event IDs are immutable; uploading the same `(app, root, device, event)` twice returns `409 Conflict`
+- blob creation uses atomic `create_new` semantics rather than overwrite-prone writes
+- SQLite replaces rewrite-the-whole-JSON metadata indexes
+- incremental listing uses a server cursor and bounded page size
+- request bodies have a configurable hard size limit
+- the server binds to localhost by default; public exposure should happen behind a properly configured TLS reverse proxy
+- application errors do not expose internal filesystem or database details
+
+This is only a foundation. See [SECURITY.md](SECURITY.md) for the threat model and work still required before a production declaration.
 
 ## Getting started
 
-1. Install dependencies:
+Install a current stable Rust toolchain, then create the secret registry:
 
-   ```bash
-   npm install
-   ```
+```bash
+cp data/secrets.example.json data/secrets.json
+```
 
-2. Configure a secret registry so the server can authenticate requests. The registry maps `appId` and `rootId` pairs to a `root_secret`. Use `data/secrets.example.json` as a template and save the real secrets at `data/secrets.json` (or point `SECRET_REGISTRY_PATH` to a different file).
+The registry maps an `appId` and `rootId` to a root secret:
 
-   ```json
-   {
-     "fattern": {
-       "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121": "example-root-secret"
-     }
-   }
-   ```
+```json
+{
+  "fattern": {
+    "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121": "replace-with-a-long-random-secret"
+  }
+}
+```
 
-3. Start the server:
+Run the service:
 
-   ```bash
-   npm start
-   ```
+```bash
+cargo run
+```
 
-   The service listens on `PORT` (default `3000`).
+By default GESH listens on `127.0.0.1:3000`.
 
 ## API
 
-All endpoints require `Authorization: Bearer <root_secret>` that matches the configured `(appId, rootId)` pair.
+All sync endpoints require:
 
-### Upload blob
+```http
+Authorization: Bearer <root_secret>
+```
+
+### Upload an immutable event
 
 ```http
 PUT /v1/sync/{appId}/{rootId}/{deviceId}/{eventId}
 Content-Type: application/octet-stream
+Authorization: Bearer <root_secret>
 ```
 
-Uploads or overwrites a blob for the device/event. Returns `201 Created` on new blobs or `200 OK` when overwriting.
+The request body is opaque ciphertext. A new event returns `201 Created`. Reusing an existing event ID returns `409 Conflict`; events cannot be overwritten.
 
-### List blobs
+### List events incrementally
 
 ```http
-GET /v1/sync/{appId}/{rootId}?deviceId={optionalDeviceId}
+GET /v1/sync/{appId}/{rootId}?after=0&limit=100&deviceId={optionalDeviceId}
+Authorization: Bearer <root_secret>
 ```
 
-Returns metadata for blobs in the root. Filter by `deviceId` to only return events from a specific device.
+`after` is an opaque server cursor from a previous response. `limit` must be between 1 and 500.
 
-### Download blob
+Example response:
+
+```json
+{
+  "events": [
+    {
+      "cursor": 42,
+      "app_id": "fattern",
+      "root_id": "root_example",
+      "device_id": "desktop_a",
+      "event_id": "event_123",
+      "created_at_ms": 1786270000000,
+      "size": 4281
+    }
+  ],
+  "next_cursor": 42
+}
+```
+
+### Download an event
 
 ```http
 GET /v1/sync/{appId}/{rootId}/{deviceId}/{eventId}
+Authorization: Bearer <root_secret>
 ```
 
-Responds with the encrypted bytes for the requested blob or `404` if missing.
+Returns `application/octet-stream` or `404 Not Found`.
 
-### Delete blob
+### Health check
 
 ```http
-DELETE /v1/sync/{appId}/{rootId}/{deviceId}/{eventId}
+GET /health
 ```
-
-Removes the blob and its metadata. Always responds with `204 No Content` even if the blob was already absent.
 
 ## Configuration
 
-Environment variables:
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `GESH_LISTEN_ADDR` | `127.0.0.1:3000` | Socket address to bind |
+| `GESH_BLOB_BASE_DIR` | `data/blobs` | Encrypted blob storage |
+| `GESH_DATABASE_URL` | `sqlite://data/gesh.db` | SQLite metadata database |
+| `GESH_SECRET_REGISTRY_PATH` | `data/secrets.json` | Root-secret registry |
+| `GESH_UPLOAD_LIMIT_BYTES` | `33554432` | Maximum event body size |
+| `RUST_LOG` | `gesh_server=info` | Structured log filter |
 
-- `PORT` – Port to listen on (default `3000`).
-- `BLOB_BASE_DIR` – Filesystem base directory for blob storage (default `data/blobs`).
-- `METADATA_BASE_DIR` – Directory for metadata indexes (default `data/metadata`).
-- `SECRET_REGISTRY_PATH` – Path to the JSON file containing root secrets (default `data/secrets.json`).
-- `UPLOAD_LIMIT` – Max upload size for blobs (default `32mb`).
+## Direction
 
-## Notes
+The next security milestones are device enrollment and revocation, root-secret rotation, ciphertext integrity metadata, rate limiting and quotas, protocol conformance tests, storage reconciliation, backup/restore documentation, and a reusable client SDK.
 
-- Blobs are stored at `BLOB_BASE_DIR/{appId}/{rootId}/{deviceId}/{eventId}.blob`.
-- Metadata is stored per root at `METADATA_BASE_DIR/{appId}/{rootId}.json` and contains `device_id`, `event_id`, `created_at`, and `size` for quick listing.
-- The service does not implement pairing or any plaintext handling; clients are responsible for encryption and lifecycle management.
+GESH should remain boring server-side. If the relay ever needs to understand invoices, notes, files, tasks, or whatever exciting new object a client invents, the protocol has gone in the wrong direction.
