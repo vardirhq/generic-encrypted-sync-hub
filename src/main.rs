@@ -21,9 +21,9 @@ use tracing_subscriber::EnvFilter;
 
 use crate::{
     auth::{SecretRegistry, is_authorized, load_secret_registry},
-    config::Config,
+    config::{Config, Retention},
     ids::is_valid_id,
-    store::{EventMetadata, Store, StoreError},
+    store::{DeviceState, EventMetadata, Store, StoreError},
 };
 
 #[derive(Clone)]
@@ -40,6 +40,12 @@ struct ListQuery {
     limit: i64,
     #[serde(rename = "deviceId")]
     device_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AckRequest {
+    #[serde(rename = "ackCursor")]
+    ack_cursor: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -191,11 +197,17 @@ async fn main() -> Result<()> {
     let config = Config::from_env()?;
     let secrets = Arc::new(load_secret_registry(&config.secret_registry_path).await?);
     let store = Store::open(&config).await?;
-    let state = AppState { secrets, store };
+    let state = AppState {
+        secrets,
+        store: store.clone(),
+    };
+
+    tokio::spawn(sweep_loop(store.clone(), config.retention.clone()));
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/sync/{app_id}/{root_id}", get(list_events))
+        .route("/v1/sync/{app_id}/{root_id}/{device_id}", put(acknowledge))
         .route(
             "/v1/sync/{app_id}/{root_id}/{device_id}/{event_id}",
             put(put_event).get(get_event),
@@ -259,6 +271,29 @@ async fn get_event(
     }
 }
 
+/// Reports how far a device has consumed the feed, releasing everything its
+/// peers have also collected.
+async fn acknowledge(
+    State(state): State<AppState>,
+    Path((app_id, root_id, device_id)): Path<(String, String, String)>,
+    _scope: SyncScope,
+    Json(request): Json<AckRequest>,
+) -> Result<Json<DeviceState>, ApiError> {
+    if request.ack_cursor < 0 {
+        return Err(ApiError::bad_request("ackCursor must be zero or greater"));
+    }
+
+    state
+        .store
+        .acknowledge(&app_id, &root_id, &device_id, request.ack_cursor)
+        .await
+        .map(Json)
+        .map_err(|err| {
+            error!(error = %err, "failed to record acknowledgement");
+            ApiError::internal()
+        })
+}
+
 async fn list_events(
     State(state): State<AppState>,
     Path((app_id, root_id)): Path<(String, String)>,
@@ -295,6 +330,32 @@ async fn list_events(
         events,
         next_cursor,
     }))
+}
+
+/// Reclaims relayed and expired data for as long as the process runs.
+///
+/// Retention is enforced here rather than on the request path so that data
+/// still ages out of a root nothing is currently talking to.
+async fn sweep_loop(store: Store, retention: Retention) {
+    let mut ticker = tokio::time::interval(retention.sweep_interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    loop {
+        ticker.tick().await;
+
+        match store.sweep(&retention).await {
+            Ok(report) if report.is_empty() => {}
+            Ok(report) => info!(
+                delivered = report.delivered,
+                expired = report.expired,
+                blobs_removed = report.blobs_removed,
+                tombstones_purged = report.tombstones_purged,
+                devices_forgotten = report.devices_forgotten,
+                "reclaimed relayed data"
+            ),
+            Err(err) => error!(error = %err, "retention sweep failed"),
+        }
+    }
 }
 
 /// Path identifiers are validated by [`SyncScope`]; this covers the ones that

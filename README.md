@@ -133,6 +133,42 @@ Authorization: Bearer <root_secret>
 
 Returns `application/octet-stream` or `404 Not Found`.
 
+### Acknowledge consumed events
+
+```http
+PUT /v1/sync/{appId}/{rootId}/{deviceId}
+Content-Type: application/json
+Authorization: Bearer <root_secret>
+
+{ "ackCursor": 42 }
+```
+
+Reports that this device has consumed the feed up to and including that cursor,
+and registers it as an active peer. Acknowledgements only move forward, so a
+retried or out-of-order report cannot rewind a device's progress.
+
+Once every active peer has acknowledged past an event, the relay has finished
+its errand and the ciphertext is erased. A device is never required to
+acknowledge its own uploads.
+
+## Retention
+
+GESH is a relay, not a record. Data is held only as long as it takes to hand it
+to the other devices on a root:
+
+- an event is erased once every active peer has acknowledged it
+- an event nobody collects is erased when it reaches `GESH_EVENT_TTL_SECONDS`
+- a device that has been silent for `GESH_DEVICE_TTL_SECONDS` stops counting as
+  a peer, so a retired device cannot pin data forever
+- an erased event leaves a tombstone for `GESH_TOMBSTONE_TTL_SECONDS`, which
+  keeps its identifier reserved so already relayed ciphertext cannot be replayed
+  back onto the root
+
+Reclamation runs on a background sweep every `GESH_SWEEP_INTERVAL_SECONDS`, so
+data ages out of a root even while no client is talking to it. Set the tombstone
+window longer than the event window; once a tombstone is purged, its identifier
+becomes reusable again.
+
 ### Health check
 
 ```http
@@ -148,6 +184,10 @@ GET /health
 | `GESH_DATABASE_URL` | `sqlite://data/gesh.db` | SQLite metadata database |
 | `GESH_SECRET_REGISTRY_PATH` | `data/secrets.json` | Root-secret registry |
 | `GESH_UPLOAD_LIMIT_BYTES` | `33554432` | Maximum event body size |
+| `GESH_EVENT_TTL_SECONDS` | `604800` | Age at which an uncollected event is erased |
+| `GESH_TOMBSTONE_TTL_SECONDS` | `2592000` | How long an erased event's ID stays reserved |
+| `GESH_DEVICE_TTL_SECONDS` | `2592000` | Silence after which a device stops counting as a peer |
+| `GESH_SWEEP_INTERVAL_SECONDS` | `60` | Delay between reclamation passes |
 | `RUST_LOG` | `gesh_server=info` | Structured log filter |
 
 ## Direction

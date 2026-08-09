@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::config::Config;
+use crate::config::{Config, Retention};
 
 #[derive(Clone)]
 pub struct Store {
@@ -27,6 +27,33 @@ pub struct EventMetadata {
     pub event_id: String,
     pub created_at_ms: i64,
     pub size: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct DeviceState {
+    pub device_id: String,
+    pub ack_cursor: i64,
+    pub last_seen_ms: i64,
+}
+
+/// What a single reclamation pass reclaimed.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct SweepReport {
+    pub delivered: u64,
+    pub expired: u64,
+    pub blobs_removed: u64,
+    pub tombstones_purged: u64,
+    pub devices_forgotten: u64,
+}
+
+impl SweepReport {
+    pub fn is_empty(&self) -> bool {
+        self.delivered == 0
+            && self.expired == 0
+            && self.blobs_removed == 0
+            && self.tombstones_purged == 0
+            && self.devices_forgotten == 0
+    }
 }
 
 #[derive(Debug, Error)]
@@ -50,36 +77,77 @@ impl Store {
             .connect_with(config.database_options.clone())
             .await?;
 
-        sqlx::query(
-            r#"
-            CREATE TABLE IF NOT EXISTS events (
-                cursor INTEGER PRIMARY KEY AUTOINCREMENT,
-                app_id TEXT NOT NULL,
-                root_id TEXT NOT NULL,
-                device_id TEXT NOT NULL,
-                event_id TEXT NOT NULL,
-                created_at_ms INTEGER NOT NULL,
-                size INTEGER NOT NULL,
-                UNIQUE(app_id, root_id, device_id, event_id)
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await?;
-
-        sqlx::query(
-            r#"
-            CREATE INDEX IF NOT EXISTS idx_events_root_cursor
-            ON events(app_id, root_id, cursor)
-            "#,
-        )
-        .execute(&pool)
-        .await?;
+        migrate(&pool).await?;
 
         Ok(Self {
             pool,
             blob_base_dir: config.blob_base_dir.clone(),
         })
+    }
+
+    /// Records how far a device has consumed the feed.
+    ///
+    /// This is what lets the relay know an event has finished its errand: once
+    /// every active peer has acknowledged past an event, nothing is waiting for
+    /// it and the ciphertext can be dropped.
+    pub async fn acknowledge(
+        &self,
+        app_id: &str,
+        root_id: &str,
+        device_id: &str,
+        ack_cursor: i64,
+    ) -> Result<DeviceState, StoreError> {
+        self.touch_device(app_id, root_id, device_id, ack_cursor)
+            .await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT ack_cursor, last_seen_ms FROM devices
+            WHERE app_id = ? AND root_id = ? AND device_id = ?
+            "#,
+        )
+        .bind(app_id)
+        .bind(root_id)
+        .bind(device_id)
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(DeviceState {
+            device_id: device_id.to_owned(),
+            ack_cursor: row.try_get("ack_cursor")?,
+            last_seen_ms: row.try_get("last_seen_ms")?,
+        })
+    }
+
+    /// Registers a device as an active peer and advances its acknowledgement.
+    ///
+    /// Acknowledgements only ever move forward, so a stale or retried report
+    /// cannot rewind a device's progress and cause data to be held again.
+    async fn touch_device(
+        &self,
+        app_id: &str,
+        root_id: &str,
+        device_id: &str,
+        ack_cursor: i64,
+    ) -> Result<(), StoreError> {
+        sqlx::query(
+            r#"
+            INSERT INTO devices(app_id, root_id, device_id, ack_cursor, last_seen_ms)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(app_id, root_id, device_id) DO UPDATE SET
+                ack_cursor = MAX(ack_cursor, excluded.ack_cursor),
+                last_seen_ms = excluded.last_seen_ms
+            "#,
+        )
+        .bind(app_id)
+        .bind(root_id)
+        .bind(device_id)
+        .bind(ack_cursor)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
     }
 
     /// Stores an event as ciphertext plus a metadata row.
@@ -125,7 +193,13 @@ impl Store {
 
         if result.is_err() {
             let _ = tokio::fs::remove_file(&staged_path).await;
+            return result;
         }
+
+        // Registers the uploader as an active peer, without advancing its
+        // acknowledgement: producing an event says nothing about having
+        // consumed the events its peers produced earlier.
+        self.touch_device(app_id, root_id, device_id, 0).await?;
 
         result
     }
@@ -197,6 +271,7 @@ impl Store {
             r#"
             SELECT cursor FROM events
             WHERE app_id = ? AND root_id = ? AND device_id = ? AND event_id = ?
+              AND deleted_at_ms IS NULL
             "#,
         )
         .bind(app_id)
@@ -232,6 +307,7 @@ impl Store {
                 SELECT cursor, app_id, root_id, device_id, event_id, created_at_ms, size
                 FROM events
                 WHERE app_id = ? AND root_id = ? AND cursor > ? AND device_id = ?
+                  AND deleted_at_ms IS NULL
                 ORDER BY cursor ASC
                 LIMIT ?
                 "#,
@@ -249,6 +325,7 @@ impl Store {
                 SELECT cursor, app_id, root_id, device_id, event_id, created_at_ms, size
                 FROM events
                 WHERE app_id = ? AND root_id = ? AND cursor > ?
+                  AND deleted_at_ms IS NULL
                 ORDER BY cursor ASC
                 LIMIT ?
                 "#,
@@ -277,6 +354,155 @@ impl Store {
             .map_err(StoreError::Sql)
     }
 
+    /// Reclaims everything the relay is no longer obliged to hold.
+    ///
+    /// Runs in four stages, each idempotent so an interrupted pass simply
+    /// resumes on the next one: retire delivered events, retire events that
+    /// outlived `event_ttl`, erase the ciphertext of retired events, then drop
+    /// the tombstones and device records that have themselves expired.
+    pub async fn sweep(&self, retention: &Retention) -> Result<SweepReport, StoreError> {
+        let now = now_ms();
+
+        Ok(SweepReport {
+            delivered: self.retire_delivered(now, retention).await?,
+            expired: self
+                .retire_older_than(now, now - millis(retention.event_ttl))
+                .await?,
+            blobs_removed: self.erase_retired_blobs().await?,
+            tombstones_purged: self
+                .purge_tombstones(now - millis(retention.tombstone_ttl))
+                .await?,
+            devices_forgotten: self
+                .forget_devices(now - millis(retention.device_ttl))
+                .await?,
+        })
+    }
+
+    /// Retires events every active peer has acknowledged.
+    ///
+    /// A device never has to acknowledge its own upload, and an event with no
+    /// active peer at all is left alone: nothing has collected it yet, so the
+    /// only thing that may retire it is [`Self::retire_older_than`].
+    async fn retire_delivered(&self, now: i64, retention: &Retention) -> Result<u64, StoreError> {
+        let active_since = now - millis(retention.device_ttl);
+
+        let result = sqlx::query(
+            r#"
+            UPDATE events SET deleted_at_ms = ?
+            WHERE deleted_at_ms IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM devices peer
+                  WHERE peer.app_id = events.app_id
+                    AND peer.root_id = events.root_id
+                    AND peer.device_id <> events.device_id
+                    AND peer.last_seen_ms >= ?
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM devices peer
+                  WHERE peer.app_id = events.app_id
+                    AND peer.root_id = events.root_id
+                    AND peer.device_id <> events.device_id
+                    AND peer.last_seen_ms >= ?
+                    AND peer.ack_cursor < events.cursor
+              )
+            "#,
+        )
+        .bind(now)
+        .bind(active_since)
+        .bind(active_since)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn retire_older_than(&self, now: i64, cutoff_ms: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            r#"
+            UPDATE events SET deleted_at_ms = ?
+            WHERE deleted_at_ms IS NULL AND created_at_ms <= ?
+            "#,
+        )
+        .bind(now)
+        .bind(cutoff_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    /// Erases the ciphertext of retired events, leaving the row as a tombstone.
+    ///
+    /// The row is cleared only after the file is gone, so a crash mid-pass
+    /// leaves the event to be retried rather than a row claiming ciphertext was
+    /// erased when it is still on disk.
+    async fn erase_retired_blobs(&self) -> Result<u64, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT cursor, app_id, root_id, device_id, event_id FROM events
+            WHERE deleted_at_ms IS NOT NULL AND blob_present = 1
+            LIMIT 1000
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut removed = 0;
+
+        for row in rows {
+            let cursor: i64 = row.try_get("cursor")?;
+            let path = self.blob_path(
+                row.try_get::<String, _>("app_id")?.as_str(),
+                row.try_get::<String, _>("root_id")?.as_str(),
+                row.try_get::<String, _>("device_id")?.as_str(),
+                row.try_get::<String, _>("event_id")?.as_str(),
+            );
+
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(StoreError::Io(err)),
+            }
+
+            sqlx::query("UPDATE events SET blob_present = 0, size = 0 WHERE cursor = ?")
+                .bind(cursor)
+                .execute(&self.pool)
+                .await?;
+
+            removed += 1;
+        }
+
+        Ok(removed)
+    }
+
+    /// Releases event identifiers whose tombstones have expired.
+    ///
+    /// Until this runs, a relayed event cannot be uploaded again under the same
+    /// identifier, which is what stops captured ciphertext being replayed onto
+    /// a root after it was delivered and erased.
+    async fn purge_tombstones(&self, cutoff_ms: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query(
+            r#"
+            DELETE FROM events
+            WHERE deleted_at_ms IS NOT NULL AND blob_present = 0 AND deleted_at_ms <= ?
+            "#,
+        )
+        .bind(cutoff_ms)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected())
+    }
+
+    async fn forget_devices(&self, cutoff_ms: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM devices WHERE last_seen_ms <= ?")
+            .bind(cutoff_ms)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
+
     fn blob_path(&self, app_id: &str, root_id: &str, device_id: &str, event_id: &str) -> PathBuf {
         self.blob_base_dir
             .join(app_id)
@@ -284,6 +510,82 @@ impl Store {
             .join(device_id)
             .join(format!("{event_id}.blob"))
     }
+}
+
+async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS events (
+            cursor INTEGER PRIMARY KEY AUTOINCREMENT,
+            app_id TEXT NOT NULL,
+            root_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            size INTEGER NOT NULL,
+            deleted_at_ms INTEGER,
+            blob_present INTEGER NOT NULL DEFAULT 1,
+            UNIQUE(app_id, root_id, device_id, event_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    // Databases created before retention existed predate the two columns above.
+    let columns: Vec<String> = sqlx::query("PRAGMA table_info(events)")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+
+    if !columns.iter().any(|name| name == "deleted_at_ms") {
+        sqlx::query("ALTER TABLE events ADD COLUMN deleted_at_ms INTEGER")
+            .execute(pool)
+            .await?;
+    }
+
+    if !columns.iter().any(|name| name == "blob_present") {
+        sqlx::query("ALTER TABLE events ADD COLUMN blob_present INTEGER NOT NULL DEFAULT 1")
+            .execute(pool)
+            .await?;
+    }
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS devices (
+            app_id TEXT NOT NULL,
+            root_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            ack_cursor INTEGER NOT NULL DEFAULT 0,
+            last_seen_ms INTEGER NOT NULL,
+            PRIMARY KEY(app_id, root_id, device_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_events_root_cursor
+        ON events(app_id, root_id, cursor)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE INDEX IF NOT EXISTS idx_events_reclaimable
+        ON events(deleted_at_ms, blob_present)
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    Ok(())
 }
 
 async fn write_staged_blob(staged_path: &Path, body: &Bytes) -> Result<(), StoreError> {
@@ -315,6 +617,10 @@ async fn sync_parent_dir(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
+fn millis(duration: std::time::Duration) -> i64 {
+    i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -339,6 +645,15 @@ mod tests {
 
     use super::*;
 
+    fn retention() -> Retention {
+        Retention {
+            event_ttl: Duration::from_secs(7 * 24 * 60 * 60),
+            tombstone_ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            device_ttl: Duration::from_secs(30 * 24 * 60 * 60),
+            sweep_interval: Duration::from_secs(60),
+        }
+    }
+
     async fn test_store() -> (Store, TempDir) {
         let dir = TempDir::new().expect("temp dir");
         let config = Config {
@@ -351,9 +666,39 @@ mod tests {
                 .journal_mode(SqliteJournalMode::Wal)
                 .busy_timeout(Duration::from_secs(5)),
             upload_limit_bytes: 1024,
+            retention: retention(),
         };
 
         (Store::open(&config).await.expect("store opens"), dir)
+    }
+
+    async fn upload(store: &Store, device_id: &str, event_id: &str) -> EventMetadata {
+        store
+            .put_event(
+                "app",
+                "root",
+                device_id,
+                event_id,
+                Bytes::from_static(b"ciphertext"),
+            )
+            .await
+            .expect("upload succeeds")
+    }
+
+    /// Backdates an event so TTL rules can be exercised without sleeping.
+    async fn age_event(store: &Store, cursor: i64, age: Duration) {
+        sqlx::query("UPDATE events SET created_at_ms = ? WHERE cursor = ?")
+            .bind(now_ms() - millis(age))
+            .bind(cursor)
+            .execute(&store.pool)
+            .await
+            .expect("backdate event");
+    }
+
+    async fn blob_exists(store: &Store, device_id: &str, event_id: &str) -> bool {
+        tokio::fs::try_exists(store.blob_path("app", "root", device_id, event_id))
+            .await
+            .expect("check blob")
     }
 
     /// Simulates a process that died after publishing ciphertext but before its
@@ -413,6 +758,132 @@ mod tests {
             .expect("listing succeeds");
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_id, "event");
+    }
+
+    #[tokio::test]
+    async fn event_is_reclaimed_once_every_peer_acknowledges_it() {
+        let (store, _dir) = test_store().await;
+        let event = upload(&store, "phone", "receipt").await;
+
+        // The desktop registers as a peer but has not caught up yet.
+        store
+            .acknowledge("app", "root", "desktop", event.cursor - 1)
+            .await
+            .expect("ack succeeds");
+        let report = store.sweep(&retention()).await.expect("sweep succeeds");
+        assert_eq!(report.delivered, 0);
+        assert!(blob_exists(&store, "phone", "receipt").await);
+
+        store
+            .acknowledge("app", "root", "desktop", event.cursor)
+            .await
+            .expect("ack succeeds");
+        let report = store.sweep(&retention()).await.expect("sweep succeeds");
+
+        assert_eq!(report.delivered, 1);
+        assert_eq!(report.blobs_removed, 1);
+        assert!(!blob_exists(&store, "phone", "receipt").await);
+        assert!(matches!(
+            store.get_event("app", "root", "phone", "receipt").await,
+            Err(StoreError::NotFound)
+        ));
+        assert!(
+            store
+                .list_events("app", "root", 0, 10, None)
+                .await
+                .expect("listing succeeds")
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn event_is_kept_while_no_peer_has_collected_it() {
+        let (store, _dir) = test_store().await;
+        upload(&store, "phone", "receipt").await;
+
+        let report = store.sweep(&retention()).await.expect("sweep succeeds");
+
+        assert_eq!(report.delivered, 0);
+        assert!(blob_exists(&store, "phone", "receipt").await);
+    }
+
+    #[tokio::test]
+    async fn unclaimed_event_expires_after_its_ttl() {
+        let (store, _dir) = test_store().await;
+        let event = upload(&store, "phone", "receipt").await;
+        age_event(&store, event.cursor, Duration::from_secs(8 * 24 * 60 * 60)).await;
+
+        let report = store.sweep(&retention()).await.expect("sweep succeeds");
+
+        assert_eq!(report.expired, 1);
+        assert_eq!(report.blobs_removed, 1);
+        assert!(!blob_exists(&store, "phone", "receipt").await);
+    }
+
+    #[tokio::test]
+    async fn relayed_event_cannot_be_replayed_while_tombstoned() {
+        let (store, _dir) = test_store().await;
+        let event = upload(&store, "phone", "receipt").await;
+        store
+            .acknowledge("app", "root", "desktop", event.cursor)
+            .await
+            .expect("ack succeeds");
+        store.sweep(&retention()).await.expect("sweep succeeds");
+
+        let err = store
+            .put_event(
+                "app",
+                "root",
+                "phone",
+                "receipt",
+                Bytes::from_static(b"replayed"),
+            )
+            .await
+            .expect_err("a relayed event cannot return");
+
+        assert!(matches!(err, StoreError::Conflict));
+        assert!(!blob_exists(&store, "phone", "receipt").await);
+    }
+
+    #[tokio::test]
+    async fn a_silent_device_stops_holding_data_back() {
+        let (store, _dir) = test_store().await;
+        upload(&store, "phone", "receipt").await;
+        store
+            .acknowledge("app", "root", "desktop", 0)
+            .await
+            .expect("ack succeeds");
+
+        // The desktop goes quiet for longer than the device TTL.
+        sqlx::query("UPDATE devices SET last_seen_ms = ? WHERE device_id = 'desktop'")
+            .bind(now_ms() - millis(Duration::from_secs(31 * 24 * 60 * 60)))
+            .execute(&store.pool)
+            .await
+            .expect("backdate device");
+
+        let report = store.sweep(&retention()).await.expect("sweep succeeds");
+
+        // Nothing is holding the event, but nothing has collected it either, so
+        // it waits for its TTL rather than being dropped.
+        assert_eq!(report.delivered, 0);
+        assert_eq!(report.devices_forgotten, 1);
+        assert!(blob_exists(&store, "phone", "receipt").await);
+    }
+
+    #[tokio::test]
+    async fn acknowledgements_only_move_forward() {
+        let (store, _dir) = test_store().await;
+
+        store
+            .acknowledge("app", "root", "desktop", 12)
+            .await
+            .expect("ack succeeds");
+        let state = store
+            .acknowledge("app", "root", "desktop", 4)
+            .await
+            .expect("ack succeeds");
+
+        assert_eq!(state.ack_cursor, 12);
     }
 
     #[tokio::test]

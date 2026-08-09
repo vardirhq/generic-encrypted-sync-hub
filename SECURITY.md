@@ -42,6 +42,8 @@ The Rust v2 foundation includes:
 - metadata rows as the sole record of event existence, so an upload interrupted before commit is retryable rather than permanently rejected
 - SQLite-backed metadata instead of whole-file JSON rewrites
 - generic external errors with detailed failures kept in server logs
+- relay retention: ciphertext erased once every active peer has acknowledged it, and bounded by a TTL when nobody collects it
+- tombstoned event identifiers, so already relayed ciphertext cannot be replayed back onto a root
 - localhost-only default binding
 - graceful process shutdown
 
@@ -52,14 +54,13 @@ The following are intentionally tracked as security work, not optional polish:
 1. device enrollment, independent device credentials, and device revocation
 2. root-secret rotation without requiring destructive re-pairing
 3. cryptographic ciphertext hashes stored and verified by clients
-4. anti-replay and protocol version rules
+4. protocol version rules, and anti-replay beyond the tombstone window
 5. rate limiting, authentication backoff, per-root quotas, and abuse controls
 6. TLS deployment guidance and hardened reverse-proxy examples
 7. backup, restore, and disaster-recovery procedures
 8. garbage collection of staging files and blobs left behind by interrupted uploads, and reconciliation of committed metadata whose ciphertext is missing or damaged
 9. security-focused integration and fuzz/property tests
-10. a documented retention/tombstone model rather than arbitrary event deletion
-11. storage permissions and container hardening guidance
+10. storage permissions and container hardening guidance
 
 Until these items have been addressed and reviewed, GESH should be treated as development software.
 
