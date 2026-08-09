@@ -35,11 +35,17 @@ The Rust v2 foundation includes:
 
 - strict identifier character/length validation before filesystem path construction
 - bounded request bodies and bounded list page sizes
-- bearer-secret authentication scoped by `(appId, rootId)`
+- per-device credentials issued by one-time enrollment codes, so a device can be revoked without disturbing any other
+- a privilege boundary between the root secret, which enrolls and revokes, and device credentials, which only relay for the device they name
+- enrollment codes and device secrets stored only as digests, and codes consumed in the same transaction that mints a credential
+- authentication and media-type checks performed before a request body is read, so unauthenticated callers cannot make the server buffer an upload
 - fixed-size SHA-256 digest comparison with constant-time equality
-- immutable event IDs and atomic create-only blob writes
+- immutable event IDs, with ciphertext staged under a temporary name and published by atomic rename
+- metadata rows as the sole record of event existence, so an upload interrupted before commit is retryable rather than permanently rejected
 - SQLite-backed metadata instead of whole-file JSON rewrites
 - generic external errors with detailed failures kept in server logs
+- relay retention: ciphertext erased once every active peer has acknowledged it, and bounded by a TTL when nobody collects it
+- tombstoned event identifiers, so already relayed ciphertext cannot be replayed back onto a root
 - localhost-only default binding
 - graceful process shutdown
 
@@ -47,18 +53,15 @@ The Rust v2 foundation includes:
 
 The following are intentionally tracked as security work, not optional polish:
 
-1. device enrollment, independent device credentials, and device revocation
-2. root-secret rotation without requiring destructive re-pairing
-3. cryptographic ciphertext hashes stored and verified by clients
-4. anti-replay and protocol version rules
-5. rate limiting, authentication backoff, per-root quotas, and abuse controls
-6. TLS deployment guidance and hardened reverse-proxy examples
-7. backup, restore, and disaster-recovery procedures
-8. metadata/blob reconciliation after interrupted or damaged storage operations
-9. security-focused integration and fuzz/property tests
-10. dependency auditing in CI and a committed `Cargo.lock`
-11. a documented retention/tombstone model rather than arbitrary event deletion
-12. storage permissions and container hardening guidance
+1. root-secret rotation without requiring destructive re-pairing, and moving the registry secret into the database
+2. cryptographic ciphertext hashes stored and verified by clients
+3. protocol version rules, and anti-replay beyond the tombstone window
+4. rate limiting and backoff on enrollment and authentication, per-root quotas, and abuse controls: a handle is guessable by design, so an enrollment code is the one credential a person types and the one worth guessing
+5. TLS deployment guidance and hardened reverse-proxy examples
+6. backup, restore, and disaster-recovery procedures
+7. garbage collection of staging files and blobs left behind by interrupted uploads, and reconciliation of committed metadata whose ciphertext is missing or damaged
+8. security-focused integration and fuzz/property tests
+9. storage permissions and container hardening guidance
 
 Until these items have been addressed and reviewed, GESH should be treated as development software.
 

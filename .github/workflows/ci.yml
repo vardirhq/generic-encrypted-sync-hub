@@ -21,17 +21,17 @@ jobs:
           rustup default stable
           rustup component add clippy rustfmt
 
-      - name: Generate lockfile
-        run: cargo generate-lockfile
+      - name: Verify lockfile is current
+        run: cargo metadata --locked --format-version 1 > /dev/null
 
       - name: Formatting
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets --all-features --locked -- -D warnings
 
       - name: Tests
-        run: cargo test --all-features
+        run: cargo test --all-features --locked
 
       - name: Dependency audit
         run: |

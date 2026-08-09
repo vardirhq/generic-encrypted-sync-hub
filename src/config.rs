@@ -10,6 +10,30 @@ pub struct Config {
     pub secret_registry_path: PathBuf,
     pub database_options: SqliteConnectOptions,
     pub upload_limit_bytes: usize,
+    pub retention: Retention,
+    /// How long an enrollment code stays redeemable. Short by design: a code is
+    /// typed by a person and is the one credential that is not high-entropy.
+    pub enrollment_code_ttl: Duration,
+}
+
+/// How long a relay holds data it has already passed on.
+///
+/// GESH is a relay, not a record: an event exists to be handed to the other
+/// devices on a root and should not outlive that errand. Ciphertext is dropped
+/// once every active peer has acknowledged it, and `event_ttl` bounds the wait
+/// when a peer never returns to collect it.
+#[derive(Clone, Debug)]
+pub struct Retention {
+    /// Maximum age of an event whose peers have not all acknowledged it.
+    pub event_ttl: Duration,
+    /// How long a deleted event's identifier stays reserved, so that already
+    /// relayed ciphertext cannot be replayed back onto the root.
+    pub tombstone_ttl: Duration,
+    /// How long a silent device still counts as a peer that must acknowledge
+    /// an event before it can be dropped.
+    pub device_ttl: Duration,
+    /// Delay between reclamation passes.
+    pub sweep_interval: Duration,
 }
 
 impl Config {
@@ -45,12 +69,36 @@ impl Config {
             anyhow::bail!("GESH_UPLOAD_LIMIT_BYTES must be greater than zero");
         }
 
+        let retention = Retention {
+            event_ttl: duration_from_env("GESH_EVENT_TTL_SECONDS", 7 * 24 * 60 * 60)?,
+            tombstone_ttl: duration_from_env("GESH_TOMBSTONE_TTL_SECONDS", 30 * 24 * 60 * 60)?,
+            device_ttl: duration_from_env("GESH_DEVICE_TTL_SECONDS", 30 * 24 * 60 * 60)?,
+            sweep_interval: duration_from_env("GESH_SWEEP_INTERVAL_SECONDS", 60)?,
+        };
+
+        if retention.sweep_interval.is_zero() {
+            anyhow::bail!("GESH_SWEEP_INTERVAL_SECONDS must be greater than zero");
+        }
+
+        let enrollment_code_ttl = duration_from_env("GESH_ENROLLMENT_CODE_TTL_SECONDS", 10 * 60)?;
+
         Ok(Self {
             listen_addr,
             blob_base_dir,
             secret_registry_path,
             database_options,
             upload_limit_bytes,
+            retention,
+            enrollment_code_ttl,
         })
     }
+}
+
+fn duration_from_env(key: &'static str, default_seconds: u64) -> Result<Duration> {
+    let seconds = env::var(key)
+        .unwrap_or_else(|_| default_seconds.to_string())
+        .parse::<u64>()
+        .with_context(|| format!("{key} must be a whole number of seconds"))?;
+
+    Ok(Duration::from_secs(seconds))
 }
