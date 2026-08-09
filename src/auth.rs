@@ -35,13 +35,13 @@ pub fn is_authorized(
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
-    value.strip_prefix("Bearer ").filter(|token| !token.is_empty())
+    value
+        .strip_prefix("Bearer ")
+        .filter(|token| !token.is_empty())
 }
 
 fn constant_time_secret_eq(expected: Option<&str>, presented: &str) -> bool {
-    let expected_hash: [u8; 32] = expected
-        .map(hash_secret)
-        .unwrap_or([0_u8; 32]);
+    let expected_hash: [u8; 32] = expected.map(hash_secret).unwrap_or([0_u8; 32]);
     let presented_hash = hash_secret(presented);
     let matches = expected_hash.ct_eq(&presented_hash);
 
@@ -58,8 +58,14 @@ mod tests {
 
     #[test]
     fn secret_comparison_accepts_only_exact_match() {
-        assert!(constant_time_secret_eq(Some("correct horse"), "correct horse"));
-        assert!(!constant_time_secret_eq(Some("correct horse"), "wrong horse"));
+        assert!(constant_time_secret_eq(
+            Some("correct horse"),
+            "correct horse"
+        ));
+        assert!(!constant_time_secret_eq(
+            Some("correct horse"),
+            "wrong horse"
+        ));
         assert!(!constant_time_secret_eq(None, "anything"));
     }
 }
