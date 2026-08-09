@@ -5,7 +5,7 @@ use std::{
 
 use bytes::Bytes;
 use serde::Serialize;
-use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
