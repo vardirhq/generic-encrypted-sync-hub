@@ -103,7 +103,13 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.status, Json(ErrorBody { error: self.message })).into_response()
+        (
+            self.status,
+            Json(ErrorBody {
+                error: self.message,
+            }),
+        )
+            .into_response()
     }
 }
 
@@ -118,10 +124,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route(
-            "/v1/sync/{app_id}/{root_id}",
-            get(list_events),
-        )
+        .route("/v1/sync/{app_id}/{root_id}", get(list_events))
         .route(
             "/v1/sync/{app_id}/{root_id}/{device_id}/{event_id}",
             put(put_event).get(get_event),
@@ -189,7 +192,9 @@ async fn get_event(
         .get_event(&app_id, &root_id, &device_id, &event_id)
         .await
     {
-        Ok(bytes) => Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response()),
+        Ok(bytes) => {
+            Ok(([(header::CONTENT_TYPE, "application/octet-stream")], bytes).into_response())
+        }
         Err(StoreError::NotFound) => Err(ApiError::not_found()),
         Err(err) => {
             error!(error = %err, "failed to read event");
@@ -265,7 +270,8 @@ fn default_limit() -> i64 {
 }
 
 fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("gesh_server=info"));
+    let filter =
+        EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("gesh_server=info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
@@ -293,5 +299,8 @@ async fn shutdown_signal() {
         _ = terminate => {},
     }
 
-    info!(timeout_seconds = Duration::from_secs(10).as_secs(), "shutdown requested");
+    info!(
+        timeout_seconds = Duration::from_secs(10).as_secs(),
+        "shutdown requested"
+    );
 }
