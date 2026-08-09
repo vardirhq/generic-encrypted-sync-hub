@@ -45,6 +45,7 @@ The server is responsible for safely handling hostile network input and protecti
 - ciphertext is staged under a temporary name and published by atomic rename, so a partially written blob is never readable
 - an event exists only once its metadata row commits; an upload interrupted before that point can be retried under the same event ID
 - requests are authenticated before their body is read
+- enrollment, handle lookup, and the credential check are rate limited per client, and repeated failures earn a doubling lockout
 - SQLite replaces rewrite-the-whole-JSON metadata indexes
 - incremental listing uses a server cursor and bounded page size
 - request bodies have a configurable hard size limit
@@ -93,6 +94,13 @@ content key handed over out of band by the device that already has it. A QR code
 shown by the desktop is the usual carrier for both; the enrollment code is short
 and unambiguous so it can also just be read aloud and typed.
 
+**The first device does not enroll.** A root comes into existence when its
+secret is written into the registry, and the device holding that secret is
+already authorized on the sync plane — there is nobody to issue it a code, and
+it is the device that generates the content key. Enrollment exists for the
+*second* device onwards: the first device names the root, mints a code, and the
+new device redeems it for a credential of its own.
+
 ```bash
 # 1. the desktop names the root, once
 curl -X PUT $GESH/v1/admin/fattern/$ROOT_ID/handle \
@@ -116,6 +124,10 @@ Codes are single-use, expire, are stored only as a hash, and are bound to the
 root that minted them. Typed codes are normalized, so case and the grouping dash
 do not matter. Re-enrolling an existing `deviceId` replaces its credential, which
 is how a reinstalled phone recovers without becoming a second device.
+
+Both halves of step 3 are throttled, and a wrong code costs a growing wait — see
+[Rate limiting](#rate-limiting). Getting a `429` here means retrying after the
+`Retry-After` header, not minting a fresh code.
 
 Revoking one device leaves every other credential untouched, and takes the
 device's claim on retained data with it:
@@ -222,6 +234,37 @@ data ages out of a root even while no client is talking to it. Set the tombstone
 window longer than the event window; once a tombstone is purged, its identifier
 becomes reusable again.
 
+## Rate limiting
+
+Almost every credential here is 244 bits of CSPRNG output and not worth
+guessing. Two things are: the enrollment code, which is short because a person
+reads it aloud, and the bearer-token check, which anyone who can reach the port
+may hammer. Both are throttled, before the request body is read:
+
+- handle lookups are capped at `GESH_HANDLE_LOOKUPS_PER_MINUTE` per client
+- redemption attempts are capped at `GESH_ENROLL_ATTEMPTS_PER_MINUTE` per
+  client, and separately at the same rate per root, so guessing a code does not
+  scale with the number of addresses an attacker holds
+- after `GESH_FAILURES_BEFORE_BACKOFF` consecutive bad codes or bad tokens, a
+  client waits one second, then two, then four, up to `GESH_MAX_BACKOFF_SECONDS`
+
+A throttled request gets `429 Too Many Requests` with a `Retry-After` header. A
+successful redemption or a working credential clears that client's failures, so
+a legitimate device that fumbles a code is not punished afterwards.
+
+Clients are identified by connection address — a whole /64 for IPv6, since a
+single host is normally handed one. **Behind a reverse proxy every request
+arrives from the proxy, so all clients would share one bucket.** Set
+`GESH_TRUSTED_FORWARDED_HEADER` (usually `x-forwarded-for`) to key on the real
+client instead. It is unset by default on purpose: anyone can send that header,
+and honouring it unconditionally would let one host claim a fresh identity on
+every request. Only the last entry is used, since that is the one the proxy
+appended, so set it only when your proxy is the sole route to the process.
+
+Limiter state is in-process and bounded. A restart forgets it, which makes this
+an abuse control rather than a durable lockout — the durable defence is that
+codes are high-entropy, single-use, and expire in minutes.
+
 ### Health check
 
 ```http
@@ -242,10 +285,15 @@ GET /health
 | `GESH_DEVICE_TTL_SECONDS` | `2592000` | Silence after which a device stops counting as a peer |
 | `GESH_SWEEP_INTERVAL_SECONDS` | `60` | Delay between reclamation passes |
 | `GESH_ENROLLMENT_CODE_TTL_SECONDS` | `600` | How long a pairing code stays redeemable |
+| `GESH_ENROLL_ATTEMPTS_PER_MINUTE` | `10` | Redemption attempts per client, and per root |
+| `GESH_HANDLE_LOOKUPS_PER_MINUTE` | `60` | Handle lookups per client |
+| `GESH_FAILURES_BEFORE_BACKOFF` | `5` | Consecutive failures before lockouts begin |
+| `GESH_MAX_BACKOFF_SECONDS` | `300` | Ceiling on the doubling lockout |
+| `GESH_TRUSTED_FORWARDED_HEADER` | unset | Proxy header naming the real client address |
 | `RUST_LOG` | `gesh_server=info` | Structured log filter |
 
 ## Direction
 
-The next security milestones are rate limiting on enrollment and authentication, root-secret rotation, ciphertext integrity metadata, rate limiting and quotas, protocol conformance tests, storage reconciliation, backup/restore documentation, and a reusable client SDK.
+The next security milestones are root-secret rotation, ciphertext integrity metadata, per-root storage quotas and throttle state that survives a restart, protocol conformance tests, storage reconciliation, backup/restore documentation, and a reusable client SDK.
 
 GESH should remain boring server-side. If the relay ever needs to understand invoices, notes, files, tasks, or whatever exciting new object a client invents, the protocol has gone in the wrong direction.

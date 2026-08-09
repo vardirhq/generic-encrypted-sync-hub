@@ -12,6 +12,7 @@ That does **not** mean a compromised GESH server is harmless. It can still delet
 - the configured secret registry
 - the configured metadata/blob storage backends
 - the administrator to provide TLS and secure host configuration when exposed beyond localhost
+- a forwarded-for header naming the real client, but only the header an administrator has named in `GESH_TRUSTED_FORWARDED_HEADER`, and only its last entry — unset, the peer address of the connection is the only identity throttling will believe
 
 ### GESH does not trust
 
@@ -39,6 +40,8 @@ The Rust v2 foundation includes:
 - a privilege boundary between the root secret, which enrolls and revokes, and device credentials, which only relay for the device they name
 - enrollment codes and device secrets stored only as digests, and codes consumed in the same transaction that mints a credential
 - authentication and media-type checks performed before a request body is read, so unauthenticated callers cannot make the server buffer an upload
+- rate limiting and exponential backoff in front of enrollment, handle lookup, and the credential check, keyed by client address and applied before the body is read
+- a per-root ceiling on enrollment attempts, so guessing a code does not scale with the number of source addresses an attacker holds
 - fixed-size SHA-256 digest comparison with constant-time equality
 - immutable event IDs, with ciphertext staged under a temporary name and published by atomic rename
 - metadata rows as the sole record of event existence, so an upload interrupted before commit is retryable rather than permanently rejected
@@ -56,7 +59,7 @@ The following are intentionally tracked as security work, not optional polish:
 1. root-secret rotation without requiring destructive re-pairing, and moving the registry secret into the database
 2. cryptographic ciphertext hashes stored and verified by clients
 3. protocol version rules, and anti-replay beyond the tombstone window
-4. rate limiting and backoff on enrollment and authentication, per-root quotas, and abuse controls: a handle is guessable by design, so an enrollment code is the one credential a person types and the one worth guessing
+4. per-root storage and upload quotas, and throttle state that survives a restart and is shared between processes: the current limiter is in-process, so a crash loop or a second replica forgets what a client was owed
 5. TLS deployment guidance and hardened reverse-proxy examples
 6. backup, restore, and disaster-recovery procedures
 7. garbage collection of staging files and blobs left behind by interrupted uploads, and reconciliation of committed metadata whose ciphertext is missing or damaged

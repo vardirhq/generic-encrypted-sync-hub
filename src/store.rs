@@ -972,7 +972,10 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use tempfile::TempDir;
 
-    use crate::credentials::{split_token, verify_secret};
+    use crate::{
+        config::Limits,
+        credentials::{split_token, verify_secret},
+    };
 
     use super::*;
 
@@ -999,6 +1002,13 @@ mod tests {
             upload_limit_bytes: 1024,
             retention: retention(),
             enrollment_code_ttl: Duration::from_secs(600),
+            limits: Limits {
+                enroll_attempts_per_minute: 10,
+                handle_lookups_per_minute: 60,
+                failures_before_backoff: 5,
+                max_backoff: Duration::from_secs(300),
+                trusted_forwarded_header: None,
+            },
         };
 
         (Store::open(&config).await.expect("store opens"), dir)

@@ -1,6 +1,7 @@
 use std::{env, net::SocketAddr, path::PathBuf, str::FromStr, time::Duration};
 
 use anyhow::{Context, Result};
+use http::HeaderName;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 #[derive(Clone, Debug)]
@@ -14,6 +15,7 @@ pub struct Config {
     /// How long an enrollment code stays redeemable. Short by design: a code is
     /// typed by a person and is the one credential that is not high-entropy.
     pub enrollment_code_ttl: Duration,
+    pub limits: Limits,
 }
 
 /// How long a relay holds data it has already passed on.
@@ -34,6 +36,32 @@ pub struct Retention {
     pub device_ttl: Duration,
     /// Delay between reclamation passes.
     pub sweep_interval: Duration,
+}
+
+/// How hard a stranger is allowed to knock.
+///
+/// These bound the unauthenticated routes and the credential check. They are
+/// not quotas on what a paired device may store; that is a separate control.
+#[derive(Clone, Debug)]
+pub struct Limits {
+    /// Redemption attempts allowed per client, and separately per root.
+    pub enroll_attempts_per_minute: u32,
+    /// Handle lookups allowed per client. This is the one route that confirms
+    /// a root exists, so it is capped even though it reveals nothing else.
+    pub handle_lookups_per_minute: u32,
+    /// Consecutive failures a client may make before lockouts begin, so an
+    /// ordinary mistyped code or stale token costs nothing.
+    pub failures_before_backoff: u32,
+    /// Longest a client can be locked out for. Each failure past the threshold
+    /// doubles the wait up to this ceiling.
+    pub max_backoff: Duration,
+    /// Header naming the real client, for deployments behind a reverse proxy.
+    ///
+    /// Unset by default, and deliberately so: any client can send
+    /// `X-Forwarded-For`, and honouring it unconditionally would let one host
+    /// claim a fresh identity on every request and never be throttled. Set it
+    /// only when a proxy you control is the sole way to reach this process.
+    pub trusted_forwarded_header: Option<HeaderName>,
 }
 
 impl Config {
@@ -82,6 +110,14 @@ impl Config {
 
         let enrollment_code_ttl = duration_from_env("GESH_ENROLLMENT_CODE_TTL_SECONDS", 10 * 60)?;
 
+        let limits = Limits {
+            enroll_attempts_per_minute: count_from_env("GESH_ENROLL_ATTEMPTS_PER_MINUTE", 10)?,
+            handle_lookups_per_minute: count_from_env("GESH_HANDLE_LOOKUPS_PER_MINUTE", 60)?,
+            failures_before_backoff: count_from_env("GESH_FAILURES_BEFORE_BACKOFF", 5)?,
+            max_backoff: duration_from_env("GESH_MAX_BACKOFF_SECONDS", 5 * 60)?,
+            trusted_forwarded_header: forwarded_header_from_env("GESH_TRUSTED_FORWARDED_HEADER")?,
+        };
+
         Ok(Self {
             listen_addr,
             blob_base_dir,
@@ -90,6 +126,7 @@ impl Config {
             upload_limit_bytes,
             retention,
             enrollment_code_ttl,
+            limits,
         })
     }
 }
@@ -101,4 +138,31 @@ fn duration_from_env(key: &'static str, default_seconds: u64) -> Result<Duration
         .with_context(|| format!("{key} must be a whole number of seconds"))?;
 
     Ok(Duration::from_secs(seconds))
+}
+
+fn count_from_env(key: &'static str, default: u32) -> Result<u32> {
+    let count = env::var(key)
+        .unwrap_or_else(|_| default.to_string())
+        .parse::<u32>()
+        .with_context(|| format!("{key} must be a whole number"))?;
+
+    if count == 0 {
+        anyhow::bail!("{key} must be greater than zero");
+    }
+
+    Ok(count)
+}
+
+fn forwarded_header_from_env(key: &'static str) -> Result<Option<HeaderName>> {
+    let Ok(name) = env::var(key) else {
+        return Ok(None);
+    };
+
+    if name.trim().is_empty() {
+        return Ok(None);
+    }
+
+    HeaderName::try_from(name.trim().to_ascii_lowercase())
+        .map(Some)
+        .with_context(|| format!("{key} must be a valid HTTP header name"))
 }
