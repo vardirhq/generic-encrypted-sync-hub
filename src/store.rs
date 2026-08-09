@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use bytes::Bytes;
@@ -10,7 +10,10 @@ use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::config::{Config, Retention};
+use crate::{
+    config::{Config, Retention},
+    credentials::{DeviceToken, EnrollmentCode, hash_code},
+};
 
 #[derive(Clone)]
 pub struct Store {
@@ -30,6 +33,38 @@ pub struct EventMetadata {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct RootRef {
+    pub app_id: String,
+    pub root_id: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrolledDevice {
+    pub app_id: String,
+    pub root_id: String,
+    pub device_id: String,
+    pub token: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct EnrolledDeviceSummary {
+    pub device_id: String,
+    pub enrolled_at_ms: i64,
+    pub last_seen_ms: Option<i64>,
+    pub ack_cursor: Option<i64>,
+}
+
+/// A credential as stored, for the authenticator to verify a presented secret
+/// against. The secret itself was never kept.
+#[derive(Debug, Clone)]
+pub struct StoredCredential {
+    pub app_id: String,
+    pub root_id: String,
+    pub device_id: String,
+    pub secret_hash: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct DeviceState {
     pub device_id: String,
     pub ack_cursor: i64,
@@ -44,6 +79,7 @@ pub struct SweepReport {
     pub blobs_removed: u64,
     pub tombstones_purged: u64,
     pub devices_forgotten: u64,
+    pub codes_expired: u64,
 }
 
 impl SweepReport {
@@ -53,6 +89,7 @@ impl SweepReport {
             && self.blobs_removed == 0
             && self.tombstones_purged == 0
             && self.devices_forgotten == 0
+            && self.codes_expired == 0
     }
 }
 
@@ -83,6 +120,242 @@ impl Store {
             pool,
             blob_base_dir: config.blob_base_dir.clone(),
         })
+    }
+
+    /// Publishes the name a device can use to find this root before it holds
+    /// any credential for it.
+    pub async fn set_handle(
+        &self,
+        app_id: &str,
+        root_id: &str,
+        handle: &str,
+    ) -> Result<(), StoreError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO roots(app_id, root_id, handle, created_at_ms)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(app_id, root_id) DO UPDATE SET handle = excluded.handle
+            "#,
+        )
+        .bind(app_id)
+        .bind(root_id)
+        .bind(handle)
+        .bind(now_ms())
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            Err(err) if is_unique_violation(&err) => Err(StoreError::Conflict),
+            Err(err) => Err(StoreError::Sql(err)),
+        }
+    }
+
+    pub async fn resolve_handle(&self, handle: &str) -> Result<RootRef, StoreError> {
+        let row = sqlx::query("SELECT app_id, root_id FROM roots WHERE handle = ?")
+            .bind(handle)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StoreError::NotFound)?;
+
+        Ok(RootRef {
+            app_id: row.try_get("app_id")?,
+            root_id: row.try_get("root_id")?,
+        })
+    }
+
+    /// Issues a one-time code that lets a device join this root.
+    ///
+    /// Only the hash is kept, so a leaked database cannot be used to enroll.
+    pub async fn create_enrollment_code(
+        &self,
+        app_id: &str,
+        root_id: &str,
+        code: &EnrollmentCode,
+        ttl: Duration,
+    ) -> Result<i64, StoreError> {
+        let now = now_ms();
+        let expires_at_ms = now + millis(ttl);
+
+        sqlx::query(
+            r#"
+            INSERT INTO enrollment_codes(code_hash, app_id, root_id, expires_at_ms, created_at_ms)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
+        )
+        .bind(code.hash())
+        .bind(app_id)
+        .bind(root_id)
+        .bind(expires_at_ms)
+        .bind(now)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(expires_at_ms)
+    }
+
+    /// Exchanges a valid code for a device's own credential.
+    ///
+    /// The code is consumed inside the same transaction that mints the
+    /// credential, so a code cannot enroll two devices even if it is redeemed
+    /// twice concurrently.
+    pub async fn redeem_enrollment_code(
+        &self,
+        code: &str,
+        device_id: &str,
+    ) -> Result<EnrolledDevice, StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            DELETE FROM enrollment_codes
+            WHERE code_hash = ? AND expires_at_ms > ?
+            RETURNING app_id, root_id
+            "#,
+        )
+        .bind(hash_code(code))
+        .bind(now_ms())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(StoreError::NotFound)?;
+
+        let app_id: String = row.try_get("app_id")?;
+        let root_id: String = row.try_get("root_id")?;
+
+        let token = DeviceToken::mint();
+
+        // Re-enrolling a device replaces its credential, which is what makes a
+        // reinstalled phone recoverable without a second device identity.
+        sqlx::query(
+            r#"
+            INSERT INTO device_credentials(
+                token_id, app_id, root_id, device_id, secret_hash, created_at_ms
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(app_id, root_id, device_id) DO UPDATE SET
+                token_id = excluded.token_id,
+                secret_hash = excluded.secret_hash,
+                created_at_ms = excluded.created_at_ms
+            "#,
+        )
+        .bind(&token.token_id)
+        .bind(&app_id)
+        .bind(&root_id)
+        .bind(device_id)
+        .bind(token.secret_hash())
+        .bind(now_ms())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        Ok(EnrolledDevice {
+            app_id,
+            root_id,
+            device_id: device_id.to_owned(),
+            token: token.presentation(),
+        })
+    }
+
+    /// Finds the credential a presented token claims to be, for the caller to
+    /// verify. Returns the scope it grants alongside the stored hash.
+    pub async fn credential(&self, token_id: &str) -> Result<Option<StoredCredential>, StoreError> {
+        let row = sqlx::query(
+            r#"
+            SELECT app_id, root_id, device_id, secret_hash FROM device_credentials
+            WHERE token_id = ?
+            "#,
+        )
+        .bind(token_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        Ok(Some(StoredCredential {
+            app_id: row.try_get("app_id")?,
+            root_id: row.try_get("root_id")?,
+            device_id: row.try_get("device_id")?,
+            secret_hash: row.try_get("secret_hash")?,
+        }))
+    }
+
+    pub async fn list_devices(
+        &self,
+        app_id: &str,
+        root_id: &str,
+    ) -> Result<Vec<EnrolledDeviceSummary>, StoreError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT credential.device_id, credential.created_at_ms, device.last_seen_ms,
+                   device.ack_cursor
+            FROM device_credentials credential
+            LEFT JOIN devices device
+              ON device.app_id = credential.app_id
+             AND device.root_id = credential.root_id
+             AND device.device_id = credential.device_id
+            WHERE credential.app_id = ? AND credential.root_id = ?
+            ORDER BY credential.created_at_ms ASC
+            "#,
+        )
+        .bind(app_id)
+        .bind(root_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                Ok(EnrolledDeviceSummary {
+                    device_id: row.try_get("device_id")?,
+                    enrolled_at_ms: row.try_get("created_at_ms")?,
+                    last_seen_ms: row.try_get("last_seen_ms")?,
+                    ack_cursor: row.try_get("ack_cursor")?,
+                })
+            })
+            .collect::<Result<Vec<_>, sqlx::Error>>()
+            .map_err(StoreError::Sql)
+    }
+
+    /// Withdraws a device's access.
+    ///
+    /// Its peer record goes with it, so a revoked device immediately stops
+    /// being something the relay waits for before erasing data.
+    pub async fn revoke_device(
+        &self,
+        app_id: &str,
+        root_id: &str,
+        device_id: &str,
+    ) -> Result<(), StoreError> {
+        let mut tx = self.pool.begin().await?;
+
+        let result = sqlx::query(
+            r#"
+            DELETE FROM device_credentials
+            WHERE app_id = ? AND root_id = ? AND device_id = ?
+            "#,
+        )
+        .bind(app_id)
+        .bind(root_id)
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StoreError::NotFound);
+        }
+
+        sqlx::query("DELETE FROM devices WHERE app_id = ? AND root_id = ? AND device_id = ?")
+            .bind(app_id)
+            .bind(root_id)
+            .bind(device_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        Ok(())
     }
 
     /// Records how far a device has consumed the feed.
@@ -375,6 +648,7 @@ impl Store {
             devices_forgotten: self
                 .forget_devices(now - millis(retention.device_ttl))
                 .await?,
+            codes_expired: self.purge_expired_codes(now).await?,
         })
     }
 
@@ -494,6 +768,17 @@ impl Store {
         Ok(result.rows_affected())
     }
 
+    /// Drops codes that can no longer be redeemed, so an unused pairing
+    /// attempt does not linger as a stored hash.
+    async fn purge_expired_codes(&self, now: i64) -> Result<u64, StoreError> {
+        let result = sqlx::query("DELETE FROM enrollment_codes WHERE expires_at_ms <= ?")
+            .bind(now)
+            .execute(&self.pool)
+            .await?;
+
+        Ok(result.rows_affected())
+    }
+
     async fn forget_devices(&self, cutoff_ms: i64) -> Result<u64, StoreError> {
         let result = sqlx::query("DELETE FROM devices WHERE last_seen_ms <= ?")
             .bind(cutoff_ms)
@@ -569,6 +854,50 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
 
     sqlx::query(
         r#"
+        CREATE TABLE IF NOT EXISTS roots (
+            app_id TEXT NOT NULL,
+            root_id TEXT NOT NULL,
+            handle TEXT NOT NULL UNIQUE,
+            created_at_ms INTEGER NOT NULL,
+            PRIMARY KEY(app_id, root_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS device_credentials (
+            token_id TEXT PRIMARY KEY,
+            app_id TEXT NOT NULL,
+            root_id TEXT NOT NULL,
+            device_id TEXT NOT NULL,
+            secret_hash BLOB NOT NULL,
+            created_at_ms INTEGER NOT NULL,
+            UNIQUE(app_id, root_id, device_id)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS enrollment_codes (
+            code_hash BLOB PRIMARY KEY,
+            app_id TEXT NOT NULL,
+            root_id TEXT NOT NULL,
+            expires_at_ms INTEGER NOT NULL,
+            created_at_ms INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        r#"
         CREATE INDEX IF NOT EXISTS idx_events_root_cursor
         ON events(app_id, root_id, cursor)
         "#,
@@ -617,7 +946,7 @@ async fn sync_parent_dir(_path: &Path) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn millis(duration: std::time::Duration) -> i64 {
+fn millis(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
 }
 
@@ -643,6 +972,8 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use tempfile::TempDir;
 
+    use crate::credentials::{split_token, verify_secret};
+
     use super::*;
 
     fn retention() -> Retention {
@@ -667,6 +998,7 @@ mod tests {
                 .busy_timeout(Duration::from_secs(5)),
             upload_limit_bytes: 1024,
             retention: retention(),
+            enrollment_code_ttl: Duration::from_secs(600),
         };
 
         (Store::open(&config).await.expect("store opens"), dir)
@@ -868,6 +1200,150 @@ mod tests {
         assert_eq!(report.delivered, 0);
         assert_eq!(report.devices_forgotten, 1);
         assert!(blob_exists(&store, "phone", "receipt").await);
+    }
+
+    #[tokio::test]
+    async fn a_code_pairs_exactly_one_device_once() {
+        let (store, _dir) = test_store().await;
+        store
+            .set_handle("app", "root", "madsen-home")
+            .await
+            .expect("handle is set");
+
+        let resolved = store
+            .resolve_handle("madsen-home")
+            .await
+            .expect("handle resolves");
+        assert_eq!(resolved.app_id, "app");
+        assert_eq!(resolved.root_id, "root");
+
+        let code = EnrollmentCode::mint();
+        store
+            .create_enrollment_code("app", "root", &code, Duration::from_secs(600))
+            .await
+            .expect("code is minted");
+
+        let enrolled = store
+            .redeem_enrollment_code(&code.code, "phone")
+            .await
+            .expect("code redeems");
+        assert_eq!(enrolled.device_id, "phone");
+
+        // The minted token verifies, and only against its own credential.
+        let (token_id, secret) = split_token(&enrolled.token).expect("token splits");
+        let stored = store
+            .credential(token_id)
+            .await
+            .expect("lookup succeeds")
+            .expect("credential exists");
+        assert_eq!(stored.device_id, "phone");
+        assert!(verify_secret(secret, &stored.secret_hash));
+        assert!(!verify_secret("guessed", &stored.secret_hash));
+
+        // A code is spent by the device that used it.
+        assert!(matches!(
+            store.redeem_enrollment_code(&code.code, "laptop").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_expired_code_no_longer_pairs() {
+        let (store, _dir) = test_store().await;
+        let code = EnrollmentCode::mint();
+        store
+            .create_enrollment_code("app", "root", &code, Duration::from_secs(600))
+            .await
+            .expect("code is minted");
+
+        sqlx::query("UPDATE enrollment_codes SET expires_at_ms = ?")
+            .bind(now_ms() - 1)
+            .execute(&store.pool)
+            .await
+            .expect("expire code");
+
+        assert!(matches!(
+            store.redeem_enrollment_code(&code.code, "phone").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoking_a_device_withdraws_only_that_device() {
+        let (store, _dir) = test_store().await;
+
+        let mut tokens = Vec::new();
+        for device_id in ["phone", "laptop"] {
+            let code = EnrollmentCode::mint();
+            store
+                .create_enrollment_code("app", "root", &code, Duration::from_secs(600))
+                .await
+                .expect("code is minted");
+            tokens.push(
+                store
+                    .redeem_enrollment_code(&code.code, device_id)
+                    .await
+                    .expect("code redeems"),
+            );
+        }
+
+        store
+            .acknowledge("app", "root", "phone", 0)
+            .await
+            .expect("ack succeeds");
+        store
+            .revoke_device("app", "root", "phone")
+            .await
+            .expect("revocation succeeds");
+
+        // The revoked credential is gone, and so is its claim on retained data.
+        let (revoked_id, _) = split_token(&tokens[0].token).expect("token splits");
+        assert!(
+            store
+                .credential(revoked_id)
+                .await
+                .expect("lookup succeeds")
+                .is_none()
+        );
+
+        let devices = store
+            .list_devices("app", "root")
+            .await
+            .expect("listing succeeds");
+        assert_eq!(devices.len(), 1);
+        assert_eq!(devices[0].device_id, "laptop");
+
+        // The other device is untouched.
+        let (kept_id, kept_secret) = split_token(&tokens[1].token).expect("token splits");
+        let stored = store
+            .credential(kept_id)
+            .await
+            .expect("lookup succeeds")
+            .expect("credential exists");
+        assert!(verify_secret(kept_secret, &stored.secret_hash));
+
+        assert!(matches!(
+            store.revoke_device("app", "root", "phone").await,
+            Err(StoreError::NotFound)
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_handle_belongs_to_one_root() {
+        let (store, _dir) = test_store().await;
+        store
+            .set_handle("app", "root", "madsen-home")
+            .await
+            .expect("handle is set");
+
+        assert!(matches!(
+            store.set_handle("app", "other", "madsen-home").await,
+            Err(StoreError::Conflict)
+        ));
+        assert!(matches!(
+            store.resolve_handle("nobody-home").await,
+            Err(StoreError::NotFound)
+        ));
     }
 
     #[tokio::test]

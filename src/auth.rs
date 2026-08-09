@@ -5,7 +5,24 @@ use http::HeaderMap;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::{
+    credentials::{split_token, verify_secret},
+    store::{Store, StoreError},
+};
+
 pub type SecretRegistry = HashMap<String, HashMap<String, String>>;
+
+/// Who a request is acting as on a root.
+///
+/// The distinction is a privilege boundary, not a label: a device credential
+/// relays events for one device, while the root secret is the authority that
+/// enrolls and revokes devices. A compromised phone therefore cannot enroll
+/// another one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Identity {
+    Root,
+    Device(String),
+}
 
 pub async fn load_secret_registry(path: &Path) -> Result<SecretRegistry> {
     let raw = tokio::fs::read_to_string(path)
@@ -15,16 +32,39 @@ pub async fn load_secret_registry(path: &Path) -> Result<SecretRegistry> {
     serde_json::from_str(&raw).context("secret registry is not valid JSON")
 }
 
-pub fn is_authorized(
+/// Resolves the identity behind a bearer token for one `(appId, rootId)`.
+///
+/// Device credentials are tried first because they are the credential a paired
+/// device holds; the registry secret remains accepted so an existing deployment
+/// keeps working, and so there is an authority to enroll the first device with.
+pub async fn authenticate(
     registry: &SecretRegistry,
+    store: &Store,
     headers: &HeaderMap,
     app_id: &str,
     root_id: &str,
-) -> bool {
+) -> Result<Option<Identity>, StoreError> {
     let Some(presented) = bearer_token(headers) else {
-        return false;
+        return Ok(None);
     };
 
+    if let Some((token_id, secret)) = split_token(presented)
+        && let Some(credential) = store.credential(token_id).await?
+        && credential.app_id == app_id
+        && credential.root_id == root_id
+        && verify_secret(secret, &credential.secret_hash)
+    {
+        return Ok(Some(Identity::Device(credential.device_id)));
+    }
+
+    if is_root_secret(registry, presented, app_id, root_id) {
+        return Ok(Some(Identity::Root));
+    }
+
+    Ok(None)
+}
+
+fn is_root_secret(registry: &SecretRegistry, presented: &str, app_id: &str, root_id: &str) -> bool {
     let expected = registry
         .get(app_id)
         .and_then(|roots| roots.get(root_id))
@@ -35,9 +75,14 @@ pub fn is_authorized(
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
     let value = headers.get(http::header::AUTHORIZATION)?.to_str().ok()?;
-    value
-        .strip_prefix("Bearer ")
-        .filter(|token| !token.is_empty())
+    let (scheme, token) = value.split_once(' ')?;
+
+    // RFC 7235 makes the scheme case-insensitive; the credential is not.
+    if !scheme.eq_ignore_ascii_case("bearer") {
+        return None;
+    }
+
+    Some(token).filter(|token| !token.is_empty())
 }
 
 fn constant_time_secret_eq(expected: Option<&str>, presented: &str) -> bool {
@@ -54,7 +99,15 @@ fn hash_secret(secret: &str) -> [u8; 32] {
 
 #[cfg(test)]
 mod tests {
+    use http::header::AUTHORIZATION;
+
     use super::*;
+
+    fn headers_with(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(AUTHORIZATION, value.parse().expect("header value"));
+        headers
+    }
 
     #[test]
     fn secret_comparison_accepts_only_exact_match() {
@@ -67,5 +120,19 @@ mod tests {
             "wrong horse"
         ));
         assert!(!constant_time_secret_eq(None, "anything"));
+    }
+
+    #[test]
+    fn the_bearer_scheme_is_case_insensitive() {
+        assert_eq!(bearer_token(&headers_with("Bearer token")), Some("token"));
+        assert_eq!(bearer_token(&headers_with("bearer token")), Some("token"));
+        assert_eq!(bearer_token(&headers_with("BEARER token")), Some("token"));
+    }
+
+    #[test]
+    fn other_schemes_and_empty_credentials_are_refused() {
+        assert_eq!(bearer_token(&headers_with("Basic token")), None);
+        assert_eq!(bearer_token(&headers_with("Bearer ")), None);
+        assert_eq!(bearer_token(&headers_with("token")), None);
     }
 }

@@ -11,6 +11,9 @@ pub struct Config {
     pub database_options: SqliteConnectOptions,
     pub upload_limit_bytes: usize,
     pub retention: Retention,
+    /// How long an enrollment code stays redeemable. Short by design: a code is
+    /// typed by a person and is the one credential that is not high-entropy.
+    pub enrollment_code_ttl: Duration,
 }
 
 /// How long a relay holds data it has already passed on.
@@ -77,6 +80,8 @@ impl Config {
             anyhow::bail!("GESH_SWEEP_INTERVAL_SECONDS must be greater than zero");
         }
 
+        let enrollment_code_ttl = duration_from_env("GESH_ENROLLMENT_CODE_TTL_SECONDS", 10 * 60)?;
+
         Ok(Self {
             listen_addr,
             blob_base_dir,
@@ -84,6 +89,7 @@ impl Config {
             database_options,
             upload_limit_bytes,
             retention,
+            enrollment_code_ttl,
         })
     }
 }
