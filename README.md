@@ -119,6 +119,8 @@ curl -X POST $GESH/v1/roots \
 # {
 #   "app_id": "fattern",
 #   "root_id": "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121",
+#   "handle": null,
+#   "device_id": "desktop",
 #   "root_token":   "<the authority: enrolls and revokes>",
 #   "device_token": "<this device's own sync credential>"
 # }
@@ -192,6 +194,17 @@ revocation, so a root can never be left with no authority over itself.
 
 ## API
 
+New to GESH? [docs/integrating.md](docs/integrating.md) walks an application
+through provisioning, syncing, and pairing in order. What follows is the
+reference.
+
+Two conventions apply everywhere. **Request bodies are camelCase and response
+bodies are snake_case** — you send `appId` and read back `app_id`. And every
+identifier in a path (`appId`, `rootId`, `deviceId`, `eventId`) must be 1–128
+characters of ASCII letters, digits, `-`, or `_`; a handle is narrower still,
+3–64 characters of lowercase letters, digits, or `-`. Anything else is `400`
+before it reaches storage.
+
 Sync endpoints accept either credential:
 
 ```http
@@ -205,6 +218,12 @@ able to arrive holding nothing: `POST /v1/roots` creates a root, and `POST
 credential. `GET /v1/roots/{handle}` resolves a typed name and reveals only
 whether it exists.
 
+On the sync plane a device credential speaks only for itself: the `{deviceId}`
+in the path must be the device the token was issued to, or the request is `401`.
+The root token is exempt, since it is the authority on the root. On the admin
+plane the rule does not apply, because there a `{deviceId}` names the subject of
+the operation rather than its author.
+
 ### Provision a root
 
 ```http
@@ -217,6 +236,109 @@ Content-Type: application/json
 `handle` is optional. Returns `201` with the root and its two credentials, which
 are shown exactly once. Open by default; set `GESH_PROVISIONING_SECRET` to
 require `Authorization: Bearer <secret>` here, and rate limited either way.
+
+### Name a root
+
+```http
+PUT /v1/admin/{appId}/{rootId}/handle
+Content-Type: application/json
+Authorization: Bearer <root_token>
+
+{ "handle": "madsen-home" }
+```
+
+Sets or replaces the name a person can type to find this root, for a root
+provisioned without one. Returns `204 No Content`, or `409 Conflict` if another
+root already holds the handle. A root reachable by pairing code alone does not
+need one.
+
+### Mint a pairing code
+
+```http
+POST /v1/admin/{appId}/{rootId}/enrollments
+Authorization: Bearer <root_token>
+```
+
+```json
+{
+  "code": "79T54-26AJX",
+  "expires_at_ms": 1786270600000,
+  "pairing_uri": "gesh://pair?s=https%3A%2F%2Fsync.example.com&c=79T54-26AJX"
+}
+```
+
+Returns `201`. `pairing_uri` is `null` unless `GESH_PUBLIC_URL` is set. **GESH
+returns a string, not an image** — the application renders the QR code itself,
+after appending the content key as a `#k=` fragment. See
+[Pairing devices](#pairing-devices).
+
+### List enrolled devices
+
+```http
+GET /v1/admin/{appId}/{rootId}/devices
+Authorization: Bearer <root_token>
+```
+
+```json
+[
+  {
+    "device_id": "phone",
+    "enrolled_at_ms": 1786270000000,
+    "last_seen_ms": 1786270450000,
+    "ack_cursor": 42
+  }
+]
+```
+
+Ordered oldest enrolment first. `last_seen_ms` and `ack_cursor` are `null` for a
+device that has enrolled but never synced. The root's own credential is not in
+this list and cannot be named in a revocation, so a root can never be left with
+no authority over itself.
+
+### Revoke a device
+
+```http
+DELETE /v1/admin/{appId}/{rootId}/devices/{deviceId}
+Authorization: Bearer <root_token>
+```
+
+Returns `204 No Content`, or `404 Not Found` for a device this root has not
+enrolled. Every other credential on the root is untouched.
+
+### Redeem a pairing code
+
+```http
+POST /v1/enroll
+POST /v1/roots/{handle}/enroll
+Content-Type: application/json
+
+{ "code": "79t5426ajx", "deviceId": "phone" }
+```
+
+Unauthenticated, because a device arriving to be paired holds nothing yet.
+
+```json
+{
+  "app_id": "fattern",
+  "root_id": "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121",
+  "device_id": "phone",
+  "token": "<this device's own sync credential>"
+}
+```
+
+Returns `201`. The code identifies its own root, so the scanned route needs no
+handle; the named route additionally requires the code to belong to that handle
+and answers `401` when it does not. A wrong or expired code is `401`, and
+repeated failures earn a growing lockout — see [Rate limiting](#rate-limiting).
+
+### Resolve a handle
+
+```http
+GET /v1/roots/{handle}
+```
+
+Unauthenticated. Returns `{"app_id": "…", "root_id": "…"}`, or `404` if no root
+holds the name. It reveals that a handle exists and nothing further.
 
 ### Upload an immutable event
 
@@ -275,6 +397,13 @@ Authorization: Bearer <root_token | device_token>
 { "ackCursor": 42 }
 ```
 
+```json
+{ "device_id": "phone", "ack_cursor": 42, "last_seen_ms": 1786270450000 }
+```
+
+The returned `ack_cursor` is the device's position *after* the report, which is
+the higher of what it already had and what it just sent.
+
 Reports that this device has consumed the feed up to and including that cursor,
 and registers it as an active peer. Acknowledgements only move forward, so a
 retried or out-of-order report cannot rewind a device's progress.
@@ -282,6 +411,44 @@ retried or out-of-order report cannot rewind a device's progress.
 Once every active peer has acknowledged past an event, the relay has finished
 its errand and the ciphertext is erased. A device is never required to
 acknowledge its own uploads.
+
+### Health check
+
+```http
+GET /health
+```
+
+Unauthenticated. Returns `{"ok": true}` whenever the process is running. It is a
+liveness check and nothing more — it does not test the database or blob store.
+
+### Errors
+
+Failures GESH raises itself return `{"error": "<message>"}`. The messages are
+deliberately generic; the detail stays in the server log.
+
+| Status | Means |
+| --- | --- |
+| `400 Bad Request` | Malformed identifier or handle, `after` below zero, `limit` outside 1–500, `ackCursor` below zero, or an upload that is not `application/octet-stream` |
+| `401 Unauthorized` | Missing, unknown, or revoked token; a device token addressing another device on the sync plane; a wrong or expired pairing code |
+| `403 Forbidden` | A valid device token on an `/v1/admin` route |
+| `404 Not Found` | Unknown event, device, root, or handle |
+| `409 Conflict` | An event ID already used on this root, or a handle already taken |
+| `429 Too Many Requests` | Throttled or locked out; honour the `Retry-After` header |
+| `500 Internal Server Error` | Storage failure |
+
+A `401` on the sync plane is worth distinguishing from a `403`: the first means
+the credential is not accepted, the second means it is accepted but is not the
+authority. Only the second is worth retrying with a different token.
+
+Three more statuses come from the framework layer, before any GESH handler runs,
+and carry a **plain-text body rather than the JSON shape above** — parse
+defensively:
+
+| Status | Means |
+| --- | --- |
+| `413 Payload Too Large` | Body above `GESH_UPLOAD_LIMIT_BYTES` |
+| `415 Unsupported Media Type` | A JSON endpoint called without `Content-Type: application/json` |
+| `422 Unprocessable Entity` | Well-formed JSON missing a required field, or with a field of the wrong type |
 
 ## Retention
 
@@ -333,12 +500,6 @@ appended, so set it only when your proxy is the sole route to the process.
 Limiter state is in-process and bounded. A restart forgets it, which makes this
 an abuse control rather than a durable lockout — the durable defence is that
 codes are high-entropy, single-use, and expire in minutes.
-
-### Health check
-
-```http
-GET /health
-```
 
 ## Configuration
 
