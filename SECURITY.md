@@ -36,8 +36,10 @@ The Rust v2 foundation includes:
 - strict identifier character/length validation before filesystem path construction
 - bounded request bodies and bounded list page sizes
 - bearer-secret authentication scoped by `(appId, rootId)`
+- authentication and media-type checks performed before a request body is read, so unauthenticated callers cannot make the server buffer an upload
 - fixed-size SHA-256 digest comparison with constant-time equality
-- immutable event IDs and atomic create-only blob writes
+- immutable event IDs, with ciphertext staged under a temporary name and published by atomic rename
+- metadata rows as the sole record of event existence, so an upload interrupted before commit is retryable rather than permanently rejected
 - SQLite-backed metadata instead of whole-file JSON rewrites
 - generic external errors with detailed failures kept in server logs
 - localhost-only default binding
@@ -54,11 +56,10 @@ The following are intentionally tracked as security work, not optional polish:
 5. rate limiting, authentication backoff, per-root quotas, and abuse controls
 6. TLS deployment guidance and hardened reverse-proxy examples
 7. backup, restore, and disaster-recovery procedures
-8. metadata/blob reconciliation after interrupted or damaged storage operations
+8. garbage collection of staging files and blobs left behind by interrupted uploads, and reconciliation of committed metadata whose ciphertext is missing or damaged
 9. security-focused integration and fuzz/property tests
-10. dependency auditing in CI and a committed `Cargo.lock`
-11. a documented retention/tombstone model rather than arbitrary event deletion
-12. storage permissions and container hardening guidance
+10. a documented retention/tombstone model rather than arbitrary event deletion
+11. storage permissions and container hardening guidance
 
 Until these items have been addressed and reviewed, GESH should be treated as development software.
 

@@ -41,7 +41,9 @@ The server is responsible for safely handling hostile network input and protecti
 - protocol identifiers are restricted before they can become filesystem path components
 - root secrets are compared through fixed-length SHA-256 digests using constant-time comparison
 - event IDs are immutable; uploading the same `(app, root, device, event)` twice returns `409 Conflict`
-- blob creation uses atomic `create_new` semantics rather than overwrite-prone writes
+- ciphertext is staged under a temporary name and published by atomic rename, so a partially written blob is never readable
+- an event exists only once its metadata row commits; an upload interrupted before that point can be retried under the same event ID
+- requests are authenticated before their body is read
 - SQLite replaces rewrite-the-whole-JSON metadata indexes
 - incremental listing uses a server cursor and bounded page size
 - request bodies have a configurable hard size limit

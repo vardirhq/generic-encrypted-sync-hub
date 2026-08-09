@@ -9,8 +9,8 @@ use anyhow::Result;
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::{DefaultBodyLimit, FromRequestParts, Path, Query, RawPathParams, State},
+    http::{StatusCode, header, request::Parts},
     response::{IntoResponse, Response},
     routing::{get, put},
 };
@@ -113,6 +113,77 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// Proof that the caller presented the root secret for the `(appId, rootId)`
+/// in the request path, and that every path identifier is well formed.
+///
+/// This is an extractor rather than a check inside the handlers so that it runs
+/// while only the request head has been read. Authorizing in the handler body
+/// would mean an anonymous caller could make the server buffer a full upload
+/// before being told it is unauthorized.
+struct SyncScope;
+
+impl FromRequestParts<AppState> for SyncScope {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let params = RawPathParams::from_request_parts(parts, state)
+            .await
+            .map_err(|_| ApiError::bad_request("invalid identifier"))?;
+
+        let mut app_id = None;
+        let mut root_id = None;
+
+        for (key, value) in &params {
+            if !is_valid_id(value) {
+                return Err(ApiError::bad_request("invalid identifier"));
+            }
+
+            match key {
+                "app_id" => app_id = Some(value.to_owned()),
+                "root_id" => root_id = Some(value.to_owned()),
+                _ => {}
+            }
+        }
+
+        let (Some(app_id), Some(root_id)) = (app_id, root_id) else {
+            error!("sync route is missing app_id or root_id path parameters");
+            return Err(ApiError::internal());
+        };
+
+        if is_authorized(&state.secrets, &parts.headers, &app_id, &root_id) {
+            Ok(Self)
+        } else {
+            Err(ApiError::unauthorized())
+        }
+    }
+}
+
+/// Rejects the wrong media type before the body is read, for the same reason
+/// [`SyncScope`] authorizes there.
+struct OctetStreamBody;
+
+impl<S: Send + Sync> FromRequestParts<S> for OctetStreamBody {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let content_type = parts
+            .headers
+            .get(header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok());
+
+        if content_type == Some("application/octet-stream") {
+            Ok(Self)
+        } else {
+            Err(ApiError::bad_request(
+                "content-type must be application/octet-stream",
+            ))
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     init_tracing();
@@ -149,22 +220,10 @@ async fn health() -> Json<HealthResponse> {
 async fn put_event(
     State(state): State<AppState>,
     Path((app_id, root_id, device_id, event_id)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
+    _scope: SyncScope,
+    _content_type: OctetStreamBody,
     body: Bytes,
 ) -> Result<impl IntoResponse, ApiError> {
-    validate_ids(&[&app_id, &root_id, &device_id, &event_id])?;
-    authorize(&state, &headers, &app_id, &root_id)?;
-
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        != Some("application/octet-stream")
-    {
-        return Err(ApiError::bad_request(
-            "content-type must be application/octet-stream",
-        ));
-    }
-
     match state
         .store
         .put_event(&app_id, &root_id, &device_id, &event_id, body)
@@ -182,11 +241,8 @@ async fn put_event(
 async fn get_event(
     State(state): State<AppState>,
     Path((app_id, root_id, device_id, event_id)): Path<(String, String, String, String)>,
-    headers: HeaderMap,
+    _scope: SyncScope,
 ) -> Result<Response, ApiError> {
-    validate_ids(&[&app_id, &root_id, &device_id, &event_id])?;
-    authorize(&state, &headers, &app_id, &root_id)?;
-
     match state
         .store
         .get_event(&app_id, &root_id, &device_id, &event_id)
@@ -207,11 +263,8 @@ async fn list_events(
     State(state): State<AppState>,
     Path((app_id, root_id)): Path<(String, String)>,
     Query(query): Query<ListQuery>,
-    headers: HeaderMap,
+    _scope: SyncScope,
 ) -> Result<Json<ListResponse>, ApiError> {
-    validate_ids(&[&app_id, &root_id])?;
-    authorize(&state, &headers, &app_id, &root_id)?;
-
     if query.after < 0 {
         return Err(ApiError::bad_request("after must be zero or greater"));
     }
@@ -244,19 +297,8 @@ async fn list_events(
     }))
 }
 
-fn authorize(
-    state: &AppState,
-    headers: &HeaderMap,
-    app_id: &str,
-    root_id: &str,
-) -> Result<(), ApiError> {
-    if is_authorized(&state.secrets, headers, app_id, root_id) {
-        Ok(())
-    } else {
-        Err(ApiError::unauthorized())
-    }
-}
-
+/// Path identifiers are validated by [`SyncScope`]; this covers the ones that
+/// arrive as query parameters instead.
 fn validate_ids(ids: &[&str]) -> Result<(), ApiError> {
     if ids.iter().all(|id| is_valid_id(id)) {
         Ok(())
