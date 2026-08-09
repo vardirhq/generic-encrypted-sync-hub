@@ -1,8 +1,11 @@
-use std::{path::PathBuf, time::{SystemTime, UNIX_EPOCH}};
+use std::{
+    path::PathBuf,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use bytes::Bytes;
 use serde::Serialize;
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{sqlite::SqlitePoolOptions, Row, SqlitePool};
 use thiserror::Error;
 use tokio::io::AsyncWriteExt;
 
@@ -40,15 +43,6 @@ pub enum StoreError {
 impl Store {
     pub async fn open(config: &Config) -> Result<Self, StoreError> {
         tokio::fs::create_dir_all(&config.blob_base_dir).await?;
-
-        if let Some(parent) = config
-            .database_options
-            .get_filename()
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            tokio::fs::create_dir_all(parent).await?;
-        }
 
         let pool = SqlitePoolOptions::new()
             .max_connections(5)
