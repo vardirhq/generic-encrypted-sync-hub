@@ -28,7 +28,7 @@ The current reference server uses:
 - Tokio for async I/O
 - SQLite via SQLx for durable event metadata and cursors
 - the local filesystem for opaque encrypted blobs
-- a root-secret registry as the enrolling authority, with per-device credentials in SQLite
+- self-provisioned roots, with the authority and every device credential held in SQLite
 
 The storage layer is intentionally simple today. S3-compatible blob storage is planned without changing the rule that GESH never receives plaintext application data.
 
@@ -41,6 +41,8 @@ The server is responsible for safely handling hostile network input and protecti
 - protocol identifiers are restricted before they can become filesystem path components
 - secrets are compared through fixed-length SHA-256 digests using constant-time comparison
 - each device holds its own credential, so one device can be revoked without re-pairing the rest
+- a root is created by the app that will own it, so no secret is ever chosen by a person or written to a file
+- the authority that enrolls and revokes is a separate credential from the one the owning app syncs with
 - event IDs are immutable; uploading the same `(app, root, device, event)` twice returns `409 Conflict`
 - ciphertext is staged under a temporary name and published by atomic rename, so a partially written blob is never readable
 - an event exists only once its metadata row commits; an upload interrupted before that point can be retried under the same event ID
@@ -56,107 +58,141 @@ This is only a foundation. See [SECURITY.md](SECURITY.md) for the threat model a
 
 ## Getting started
 
-Install a current stable Rust toolchain, then create the secret registry:
-
-```bash
-cp data/secrets.example.json data/secrets.json
-```
-
-The registry maps an `appId` and `rootId` to a root secret:
-
-```json
-{
-  "fattern": {
-    "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121": "replace-with-a-long-random-secret"
-  }
-}
-```
-
-Run the service:
+Install a current stable Rust toolchain and run the service:
 
 ```bash
 cargo run
 ```
 
-By default GESH listens on `127.0.0.1:3000`.
+By default GESH listens on `127.0.0.1:3000`. There is nothing to configure and
+no secret to write down — an app creates its own root the first time it runs.
 
-## Pairing a device
+> Deployments from before self-provisioning used a hand-written
+> `data/secrets.json` registry mapping `appId` → `rootId` → secret. Those
+> secrets still authenticate, so an existing install keeps working, but the file
+> is no longer read if it is absent and nothing new should be added to it.
 
-A root has two kinds of credential, and the difference is a privilege boundary.
-The **root secret** from the registry is the authority: it names the root and
-enrolls and revokes devices. A **device credential** is issued by enrollment and
-speaks for one device only, so a compromised phone cannot enroll another device
-or act as one.
+## Pairing devices
 
-Both are transport credentials. GESH never holds the key that decrypts an event,
-so pairing always has two halves: the credential the server issues, and the
-content key handed over out of band by the device that already has it. A QR code
-shown by the desktop is the usual carrier for both; the enrollment code is short
-and unambiguous so it can also just be read aloud and typed.
+The person using the app should never see any of this. No file to edit, no
+secret to copy, no identifier to type.
 
-**The first device does not enroll.** A root comes into existence when its
-secret is written into the registry, and the device holding that secret is
-already authorized on the sync plane — there is nobody to issue it a code, and
-it is the device that generates the content key. Enrollment exists for the
-*second* device onwards: the first device names the root, mints a code, and the
-new device redeems it for a credential of its own.
+### The first device provisions itself
+
+The app calls this once, on first launch, and stores what comes back:
 
 ```bash
-# 1. the desktop names the root, once
-curl -X PUT $GESH/v1/admin/fattern/$ROOT_ID/handle \
-     -H "Authorization: Bearer $ROOT_SECRET" \
-     -H 'Content-Type: application/json' -d '{"handle":"madsen-home"}'
+curl -X POST $GESH/v1/roots \
+     -H 'Content-Type: application/json' \
+     -d '{"appId":"fattern","deviceId":"desktop"}'
+# {
+#   "app_id": "fattern",
+#   "root_id": "root_7c5e1bb3-fca2-4e24-8c15-0fbb72e4f121",
+#   "root_token":   "<the authority: enrolls and revokes>",
+#   "device_token": "<this device's own sync credential>"
+# }
+```
 
-# 2. the desktop mints a one-time code, valid for ten minutes by default
+That app is now the source of truth for the root. It is the only thing that can
+add a device or take one away, and it is where the content key lives — GESH
+never sees that key and cannot help anyone recover it.
+
+**Two tokens, because the app plays two parts.** `root_token` is the authority.
+`device_token` is what it relays its own events with, exactly like any other
+device. Keeping them apart costs the app nothing and means the credential in
+daily use cannot revoke anybody.
+
+`handle` is optional in the request. A root is reachable by pairing code alone,
+so only set a name if people are meant to type one.
+
+### The second device scans
+
+```bash
+# the first device mints a one-time code, valid for ten minutes by default
 curl -X POST $GESH/v1/admin/fattern/$ROOT_ID/enrollments \
-     -H "Authorization: Bearer $ROOT_SECRET"
-# {"code":"79T54-26AJX","expires_at_ms":...}
+     -H "Authorization: Bearer $ROOT_TOKEN"
+# {"code":"79T54-26AJX","pairing_uri":"gesh://pair?s=...&c=79T54-26AJX",...}
 
-# 3. the phone finds the root by handle, then redeems the code for its own token
-curl $GESH/v1/roots/madsen-home
-curl -X POST $GESH/v1/roots/madsen-home/enroll \
+# the new device redeems what it scanned — no handle, no root id
+curl -X POST $GESH/v1/enroll \
      -H 'Content-Type: application/json' \
      -d '{"code":"79t5426ajx","deviceId":"phone"}'
-# {"device_id":"phone","token":"<the phone's own bearer token>",...}
+# {"app_id":"fattern","root_id":"root_7c5e...","device_id":"phone","token":"..."}
 ```
+
+`pairing_uri` is present once `GESH_PUBLIC_URL` is set, and is the string to put
+in the QR code. It carries where to go and what to say, and nothing that
+identifies the root — the code already does that.
+
+**The app appends the content key as a fragment**, which is the second half of
+pairing and the half GESH must never learn:
+
+```text
+gesh://pair?s=https%3A%2F%2Fsync.example.com&c=79T54-26AJX#k=<content key>
+```
+
+A URI fragment is never transmitted to a server, so one QR code can carry both
+halves while the relay only ever receives one of them.
 
 Codes are single-use, expire, are stored only as a hash, and are bound to the
 root that minted them. Typed codes are normalized, so case and the grouping dash
-do not matter. Re-enrolling an existing `deviceId` replaces its credential, which
-is how a reinstalled phone recovers without becoming a second device.
+do not matter — the alphabet drops `0`/`O` and `1`/`I` so a code can be read
+aloud when there is no camera. Re-enrolling an existing `deviceId` replaces its
+credential, which is how a reinstalled phone recovers without becoming a second
+device.
 
-Both halves of step 3 are throttled, and a wrong code costs a growing wait — see
-[Rate limiting](#rate-limiting). Getting a `429` here means retrying after the
-`Retry-After` header, not minting a fresh code.
+Redemption is throttled and a wrong code costs a growing wait — see
+[Rate limiting](#rate-limiting). A `429` means honour the `Retry-After` header;
+minting a fresh code will not help, because the lockout is on the client.
+
+### Revoking
 
 Revoking one device leaves every other credential untouched, and takes the
 device's claim on retained data with it:
 
 ```bash
-curl $GESH/v1/admin/fattern/$ROOT_ID/devices -H "Authorization: Bearer $ROOT_SECRET"
+curl $GESH/v1/admin/fattern/$ROOT_ID/devices -H "Authorization: Bearer $ROOT_TOKEN"
 curl -X DELETE $GESH/v1/admin/fattern/$ROOT_ID/devices/phone \
-     -H "Authorization: Bearer $ROOT_SECRET"
+     -H "Authorization: Bearer $ROOT_TOKEN"
 ```
+
+The root's own credential is not in that list and cannot be named in a
+revocation, so a root can never be left with no authority over itself.
 
 ## API
 
 Sync endpoints accept either credential:
 
 ```http
-Authorization: Bearer <root_secret | device_token>
+Authorization: Bearer <root_token | device_token>
 ```
 
-Admin endpoints under `/v1/admin` require the root secret and answer `403`
-to a device credential. `GET /v1/roots/{handle}` and `POST
-/v1/roots/{handle}/enroll` are the only unauthenticated routes: a device being
-paired has to find its root before it holds anything to prove with.
+Admin endpoints under `/v1/admin` require the root token and answer `403` to a
+device credential. Three routes are unauthenticated, because a device has to be
+able to arrive holding nothing: `POST /v1/roots` creates a root, and `POST
+/v1/enroll` and `POST /v1/roots/{handle}/enroll` trade a pairing code for a
+credential. `GET /v1/roots/{handle}` resolves a typed name and reveals only
+whether it exists.
+
+### Provision a root
+
+```http
+POST /v1/roots
+Content-Type: application/json
+
+{ "appId": "fattern", "deviceId": "desktop", "handle": "madsen-home" }
+```
+
+`handle` is optional. Returns `201` with the root and its two credentials, which
+are shown exactly once. Open by default; set `GESH_PROVISIONING_SECRET` to
+require `Authorization: Bearer <secret>` here, and rate limited either way.
 
 ### Upload an immutable event
 
 ```http
 PUT /v1/sync/{appId}/{rootId}/{deviceId}/{eventId}
 Content-Type: application/octet-stream
-Authorization: Bearer <root_secret>
+Authorization: Bearer <root_token | device_token>
 ```
 
 The request body is opaque ciphertext. A new event returns `201 Created`. Reusing an existing event ID returns `409 Conflict`; events cannot be overwritten.
@@ -165,7 +201,7 @@ The request body is opaque ciphertext. A new event returns `201 Created`. Reusin
 
 ```http
 GET /v1/sync/{appId}/{rootId}?after=0&limit=100&deviceId={optionalDeviceId}
-Authorization: Bearer <root_secret>
+Authorization: Bearer <root_token | device_token>
 ```
 
 `after` is an opaque server cursor from a previous response. `limit` must be between 1 and 500.
@@ -193,7 +229,7 @@ Example response:
 
 ```http
 GET /v1/sync/{appId}/{rootId}/{deviceId}/{eventId}
-Authorization: Bearer <root_secret>
+Authorization: Bearer <root_token | device_token>
 ```
 
 Returns `application/octet-stream` or `404 Not Found`.
@@ -203,7 +239,7 @@ Returns `application/octet-stream` or `404 Not Found`.
 ```http
 PUT /v1/sync/{appId}/{rootId}/{deviceId}
 Content-Type: application/json
-Authorization: Bearer <root_secret>
+Authorization: Bearer <root_token | device_token>
 
 { "ackCursor": 42 }
 ```
@@ -241,6 +277,8 @@ guessing. Two things are: the enrollment code, which is short because a person
 reads it aloud, and the bearer-token check, which anyone who can reach the port
 may hammer. Both are throttled, before the request body is read:
 
+- root creation is capped at `GESH_ROOTS_PER_MINUTE` per client, which is what
+  stops an open server being turned into free storage
 - handle lookups are capped at `GESH_HANDLE_LOOKUPS_PER_MINUTE` per client
 - redemption attempts are capped at `GESH_ENROLL_ATTEMPTS_PER_MINUTE` per
   client, and separately at the same rate per root, so guessing a code does not
@@ -278,7 +316,9 @@ GET /health
 | `GESH_LISTEN_ADDR` | `127.0.0.1:3000` | Socket address to bind |
 | `GESH_BLOB_BASE_DIR` | `data/blobs` | Encrypted blob storage |
 | `GESH_DATABASE_URL` | `sqlite://data/gesh.db` | SQLite metadata database |
-| `GESH_SECRET_REGISTRY_PATH` | `data/secrets.json` | Root-secret registry |
+| `GESH_SECRET_REGISTRY_PATH` | `data/secrets.json` | Legacy root-secret registry, optional |
+| `GESH_PROVISIONING_SECRET` | unset | Required to create a root, when set |
+| `GESH_PUBLIC_URL` | unset | Address embedded in the pairing URI |
 | `GESH_UPLOAD_LIMIT_BYTES` | `33554432` | Maximum event body size |
 | `GESH_EVENT_TTL_SECONDS` | `604800` | Age at which an uncollected event is erased |
 | `GESH_TOMBSTONE_TTL_SECONDS` | `2592000` | How long an erased event's ID stays reserved |
@@ -286,6 +326,7 @@ GET /health
 | `GESH_SWEEP_INTERVAL_SECONDS` | `60` | Delay between reclamation passes |
 | `GESH_ENROLLMENT_CODE_TTL_SECONDS` | `600` | How long a pairing code stays redeemable |
 | `GESH_ENROLL_ATTEMPTS_PER_MINUTE` | `10` | Redemption attempts per client, and per root |
+| `GESH_ROOTS_PER_MINUTE` | `5` | Roots one client may create per minute |
 | `GESH_HANDLE_LOOKUPS_PER_MINUTE` | `60` | Handle lookups per client |
 | `GESH_FAILURES_BEFORE_BACKOFF` | `5` | Consecutive failures before lockouts begin |
 | `GESH_MAX_BACKOFF_SECONDS` | `300` | Ceiling on the doubling lockout |

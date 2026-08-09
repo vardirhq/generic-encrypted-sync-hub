@@ -54,6 +54,61 @@ pub struct EnrolledDeviceSummary {
     pub ack_cursor: Option<i64>,
 }
 
+/// What a root looks like the moment it is created, and the only time its
+/// credentials are ever recoverable.
+///
+/// Two tokens rather than one, because the source app plays two parts. It is
+/// the authority that enrolls and revokes, and it is also just another device
+/// relaying its own events. Keeping those apart means the credential doing the
+/// day-to-day sync cannot revoke anybody.
+#[derive(Debug, Clone, Serialize)]
+pub struct ProvisionedRoot {
+    pub app_id: String,
+    pub root_id: String,
+    pub handle: Option<String>,
+    pub device_id: String,
+    pub root_token: String,
+    pub device_token: String,
+}
+
+/// What a credential is allowed to do.
+///
+/// This is the privilege boundary the whole pairing model rests on, so it is
+/// stored explicitly rather than inferred from which table a row sits in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CredentialRole {
+    Root,
+    Device,
+}
+
+impl CredentialRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Root => "root",
+            Self::Device => "device",
+        }
+    }
+
+    /// Anything that is not explicitly the authority is treated as a device,
+    /// so an unreadable row can only ever lose privilege.
+    fn from_stored(value: &str) -> Self {
+        if value == Self::Root.as_str() {
+            Self::Root
+        } else {
+            Self::Device
+        }
+    }
+}
+
+/// The `device_id` a root credential is filed under.
+///
+/// A root credential is not held on behalf of any device, but the table's
+/// uniqueness rule is `(app_id, root_id, device_id)`, and reusing it here is
+/// what limits a root to exactly one authority credential. The `@` guarantees
+/// no real device can collide with it: [`crate::ids::is_valid_id`] rejects the
+/// character, so no such `device_id` can ever arrive from a request.
+const ROOT_CREDENTIAL_HOLDER: &str = "@root";
+
 /// A credential as stored, for the authenticator to verify a presented secret
 /// against. The secret itself was never kept.
 #[derive(Debug, Clone)]
@@ -62,6 +117,7 @@ pub struct StoredCredential {
     pub root_id: String,
     pub device_id: String,
     pub secret_hash: Vec<u8>,
+    pub role: CredentialRole,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -119,6 +175,82 @@ impl Store {
         Ok(Self {
             pool,
             blob_base_dir: config.blob_base_dir.clone(),
+        })
+    }
+
+    /// Creates a root and hands its credentials back exactly once.
+    ///
+    /// This is what replaces an administrator hand-writing a secret registry.
+    /// The app that calls it becomes the authority for the root it just made:
+    /// nothing else can enroll a device onto it or revoke one from it. The
+    /// server chooses the root identifier so that two apps provisioning at the
+    /// same moment cannot land on the same one.
+    pub async fn provision_root(
+        &self,
+        app_id: &str,
+        device_id: &str,
+        handle: Option<&str>,
+    ) -> Result<ProvisionedRoot, StoreError> {
+        let root_id = format!("root_{}", Uuid::new_v4());
+        let root_token = DeviceToken::mint();
+        let device_token = DeviceToken::mint();
+        let now = now_ms();
+
+        let mut tx = self.pool.begin().await?;
+
+        if let Some(handle) = handle {
+            let named = sqlx::query(
+                r#"
+                INSERT INTO roots(app_id, root_id, handle, created_at_ms)
+                VALUES (?, ?, ?, ?)
+                "#,
+            )
+            .bind(app_id)
+            .bind(&root_id)
+            .bind(handle)
+            .bind(now)
+            .execute(&mut *tx)
+            .await;
+
+            match named {
+                Ok(_) => {}
+                Err(err) if is_unique_violation(&err) => return Err(StoreError::Conflict),
+                Err(err) => return Err(StoreError::Sql(err)),
+            }
+        }
+
+        for (token, holder, role) in [
+            (&root_token, ROOT_CREDENTIAL_HOLDER, CredentialRole::Root),
+            (&device_token, device_id, CredentialRole::Device),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO device_credentials(
+                    token_id, app_id, root_id, device_id, secret_hash, role, created_at_ms
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                "#,
+            )
+            .bind(&token.token_id)
+            .bind(app_id)
+            .bind(&root_id)
+            .bind(holder)
+            .bind(token.secret_hash())
+            .bind(role.as_str())
+            .bind(now)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+
+        Ok(ProvisionedRoot {
+            app_id: app_id.to_owned(),
+            root_id,
+            handle: handle.map(str::to_owned),
+            device_id: device_id.to_owned(),
+            root_token: root_token.presentation(),
+            device_token: device_token.presentation(),
         })
     }
 
@@ -229,9 +361,9 @@ impl Store {
         sqlx::query(
             r#"
             INSERT INTO device_credentials(
-                token_id, app_id, root_id, device_id, secret_hash, created_at_ms
+                token_id, app_id, root_id, device_id, secret_hash, role, created_at_ms
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(app_id, root_id, device_id) DO UPDATE SET
                 token_id = excluded.token_id,
                 secret_hash = excluded.secret_hash,
@@ -243,6 +375,7 @@ impl Store {
         .bind(&root_id)
         .bind(device_id)
         .bind(token.secret_hash())
+        .bind(CredentialRole::Device.as_str())
         .bind(now_ms())
         .execute(&mut *tx)
         .await?;
@@ -262,7 +395,7 @@ impl Store {
     pub async fn credential(&self, token_id: &str) -> Result<Option<StoredCredential>, StoreError> {
         let row = sqlx::query(
             r#"
-            SELECT app_id, root_id, device_id, secret_hash FROM device_credentials
+            SELECT app_id, root_id, device_id, secret_hash, role FROM device_credentials
             WHERE token_id = ?
             "#,
         )
@@ -279,6 +412,7 @@ impl Store {
             root_id: row.try_get("root_id")?,
             device_id: row.try_get("device_id")?,
             secret_hash: row.try_get("secret_hash")?,
+            role: CredentialRole::from_stored(row.try_get::<String, _>("role")?.as_str()),
         }))
     }
 
@@ -297,6 +431,7 @@ impl Store {
              AND device.root_id = credential.root_id
              AND device.device_id = credential.device_id
             WHERE credential.app_id = ? AND credential.root_id = ?
+              AND credential.role = 'device'
             ORDER BY credential.created_at_ms ASC
             "#,
         )
@@ -322,6 +457,11 @@ impl Store {
     ///
     /// Its peer record goes with it, so a revoked device immediately stops
     /// being something the relay waits for before erasing data.
+    ///
+    /// Only device credentials can be withdrawn this way. The root's own
+    /// credential is filed under a `device_id` no request can express, and the
+    /// role check below says so a second time: revocation must never be able to
+    /// leave a root with no authority over itself.
     pub async fn revoke_device(
         &self,
         app_id: &str,
@@ -333,7 +473,7 @@ impl Store {
         let result = sqlx::query(
             r#"
             DELETE FROM device_credentials
-            WHERE app_id = ? AND root_id = ? AND device_id = ?
+            WHERE app_id = ? AND root_id = ? AND device_id = ? AND role = 'device'
             "#,
         )
         .bind(app_id)
@@ -874,6 +1014,7 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
             root_id TEXT NOT NULL,
             device_id TEXT NOT NULL,
             secret_hash BLOB NOT NULL,
+            role TEXT NOT NULL DEFAULT 'device',
             created_at_ms INTEGER NOT NULL,
             UNIQUE(app_id, root_id, device_id)
         )
@@ -881,6 +1022,23 @@ async fn migrate(pool: &SqlitePool) -> Result<(), StoreError> {
     )
     .execute(pool)
     .await?;
+
+    // Databases created before roots could provision themselves hold only
+    // device credentials, which is exactly what the default says.
+    let credential_columns: Vec<String> = sqlx::query("PRAGMA table_info(device_credentials)")
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect();
+
+    if !credential_columns.iter().any(|name| name == "role") {
+        sqlx::query(
+            "ALTER TABLE device_credentials ADD COLUMN role TEXT NOT NULL DEFAULT 'device'",
+        )
+        .execute(pool)
+        .await?;
+    }
 
     sqlx::query(
         r#"
@@ -1002,8 +1160,11 @@ mod tests {
             upload_limit_bytes: 1024,
             retention: retention(),
             enrollment_code_ttl: Duration::from_secs(600),
+            provisioning_secret: None,
+            public_url: None,
             limits: Limits {
                 enroll_attempts_per_minute: 10,
+                roots_per_minute: 5,
                 handle_lookups_per_minute: 60,
                 failures_before_backoff: 5,
                 max_backoff: Duration::from_secs(300),

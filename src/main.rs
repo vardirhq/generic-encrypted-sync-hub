@@ -27,14 +27,14 @@ use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::{
-    auth::{Identity, SecretRegistry, authenticate, load_secret_registry},
+    auth::{Identity, SecretRegistry, authenticate, load_secret_registry, presents_secret},
     config::{Config, Limits, Retention},
     credentials::EnrollmentCode,
     ids::{is_valid_handle, is_valid_id},
     ratelimit::{Backoff, Quota, RateLimiter},
     store::{
-        DeviceState, EnrolledDevice, EnrolledDeviceSummary, EventMetadata, RootRef, Store,
-        StoreError,
+        DeviceState, EnrolledDevice, EnrolledDeviceSummary, EventMetadata, ProvisionedRoot,
+        RootRef, Store, StoreError,
     },
 };
 
@@ -47,6 +47,8 @@ struct AppState {
     secrets: Arc<SecretRegistry>,
     store: Store,
     enrollment_code_ttl: Duration,
+    provisioning_secret: Option<Arc<String>>,
+    public_url: Option<Arc<String>>,
     throttles: Arc<Throttles>,
     trusted_forwarded_header: Option<HeaderName>,
 }
@@ -72,11 +74,15 @@ struct Throttles {
     auth_failures: Backoff,
     /// Per client: handle lookups, the one route that confirms a root exists.
     handle_lookups: RateLimiter,
+    /// Per client: root creation. Provisioning is open by default, so this is
+    /// the only thing standing between a reachable server and free storage.
+    provisioning: RateLimiter,
 }
 
 impl Throttles {
     fn new(limits: &Limits) -> Self {
         Self {
+            provisioning: RateLimiter::new(Quota::per_minute(limits.roots_per_minute)),
             enroll: RateLimiter::new(Quota::per_minute(limits.enroll_attempts_per_minute)),
             enroll_root: RateLimiter::new(Quota::per_minute(limits.enroll_attempts_per_minute)),
             enroll_failures: Backoff::new(
@@ -116,10 +122,25 @@ struct RedeemRequest {
     device_id: String,
 }
 
+#[derive(Debug, Deserialize)]
+struct ProvisionRequest {
+    #[serde(rename = "appId")]
+    app_id: String,
+    #[serde(rename = "deviceId")]
+    device_id: String,
+    /// Optional. A root is reachable by pairing code alone, so a name is only
+    /// worth setting if people are meant to type it.
+    handle: Option<String>,
+}
+
 #[derive(Debug, Serialize)]
 struct EnrollmentResponse {
     code: String,
     expires_at_ms: i64,
+    /// Everything a new device needs, ready to put in a QR code — except the
+    /// content key, which this server has never seen. The app appends that as
+    /// a `#k=` fragment, which is never transmitted to any server.
+    pairing_uri: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -452,9 +473,11 @@ impl<S: Send + Sync> FromRequestParts<S> for OctetStreamBody {
 /// This is an extractor rather than a check inside the handler so that a caller
 /// which is over its limit is turned away before the server parses anything it
 /// sent.
+/// A pairing code carries its own root, so the handle is optional: a device
+/// that scanned a QR code has one, and a person typing a name has the other.
 struct EnrollmentAttempt {
     client: String,
-    handle: String,
+    handle: Option<String>,
 }
 
 impl FromRequestParts<AppState> for EnrollmentAttempt {
@@ -464,11 +487,18 @@ impl FromRequestParts<AppState> for EnrollmentAttempt {
         parts: &mut Parts,
         state: &AppState,
     ) -> Result<Self, Self::Rejection> {
-        let Path(handle) = Path::<String>::from_request_parts(parts, state)
+        let params = RawPathParams::from_request_parts(parts, state)
             .await
             .map_err(|_| ApiError::bad_request("invalid handle"))?;
 
-        if !is_valid_handle(&handle) {
+        let handle = params
+            .iter()
+            .find(|(key, _)| *key == "handle")
+            .map(|(_, value)| value.to_owned());
+
+        if let Some(handle) = &handle
+            && !is_valid_handle(handle)
+        {
             return Err(ApiError::bad_request("invalid handle"));
         }
 
@@ -486,12 +516,58 @@ impl FromRequestParts<AppState> for EnrollmentAttempt {
             .enroll
             .check(&client)
             .map_err(ApiError::too_many_requests)?;
-        throttles
-            .enroll_root
-            .check(&handle)
-            .map_err(ApiError::too_many_requests)?;
+
+        // Only the named route can charge a root: on the code-only route the
+        // root is not known until the code is looked up, and an attacker
+        // guessing codes is not aiming at any root in particular anyway.
+        if let Some(handle) = &handle {
+            throttles
+                .enroll_root
+                .check(handle)
+                .map_err(ApiError::too_many_requests)?;
+        }
 
         Ok(Self { client, handle })
+    }
+}
+
+/// A caller cleared to create a root.
+///
+/// Provisioning is open unless an operator sets a secret, so what stands in
+/// front of it is the rate limit rather than a credential.
+struct Provisioner;
+
+impl FromRequestParts<AppState> for Provisioner {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        let client = client_key(parts, state);
+
+        state
+            .throttles
+            .auth_failures
+            .check(&client)
+            .map_err(ApiError::too_many_requests)?;
+        state
+            .throttles
+            .provisioning
+            .check(&client)
+            .map_err(ApiError::too_many_requests)?;
+
+        let Some(expected) = &state.provisioning_secret else {
+            return Ok(Self);
+        };
+
+        if presents_secret(&parts.headers, expected) {
+            state.throttles.auth_failures.record_success(&client);
+            return Ok(Self);
+        }
+
+        state.throttles.auth_failures.record_failure(&client);
+        Err(ApiError::unauthorized())
     }
 }
 
@@ -506,12 +582,18 @@ async fn main() -> Result<()> {
         secrets,
         store: store.clone(),
         enrollment_code_ttl: config.enrollment_code_ttl,
+        provisioning_secret: config.provisioning_secret.clone().map(Arc::new),
+        public_url: config.public_url.clone().map(Arc::new),
         throttles: Arc::new(Throttles::new(&config.limits)),
         trusted_forwarded_header: config.limits.trusted_forwarded_header.clone(),
     };
 
     if let Some(header) = &state.trusted_forwarded_header {
         info!(header = %header, "trusting a proxy header for the client address");
+    }
+
+    if state.provisioning_secret.is_none() {
+        info!("root provisioning is open; set GESH_PROVISIONING_SECRET to require a secret");
     }
 
     tokio::spawn(sweep_loop(store.clone(), config.retention.clone()));
@@ -536,6 +618,8 @@ async fn main() -> Result<()> {
 fn router(state: AppState, upload_limit_bytes: usize) -> Router {
     Router::new()
         .route("/health", get(health))
+        .route("/v1/roots", post(provision_root))
+        .route("/v1/enroll", post(redeem_enrollment))
         .route("/v1/roots/{handle}", get(resolve_handle))
         .route("/v1/roots/{handle}/enroll", post(redeem_enrollment))
         .route("/v1/admin/{app_id}/{root_id}/handle", put(set_handle))
@@ -599,6 +683,59 @@ async fn get_event(
         Err(StoreError::NotFound) => Err(ApiError::not_found()),
         Err(err) => {
             error!(error = %err, "failed to read event");
+            Err(ApiError::internal())
+        }
+    }
+}
+
+/// Creates a root and hands back the credentials for it.
+///
+/// This is what removes the human from setup. An app installed on its first
+/// device calls this once, stores what comes back, and is from that moment the
+/// authority for the root: the only thing that can enroll another device onto
+/// it or revoke one from it. Nobody edits a file on the server, and no secret
+/// is chosen by a person.
+///
+/// Two tokens come back because the app plays two parts. `root_token` enrolls
+/// and revokes; `device_token` is what it relays its own events with. An app
+/// that keeps them apart loses nothing, and gains that the credential in daily
+/// use cannot revoke anybody.
+async fn provision_root(
+    State(state): State<AppState>,
+    _scope: Provisioner,
+    Json(request): Json<ProvisionRequest>,
+) -> Result<(StatusCode, Json<ProvisionedRoot>), ApiError> {
+    if !is_valid_id(&request.app_id) || !is_valid_id(&request.device_id) {
+        return Err(ApiError::bad_request("invalid identifier"));
+    }
+
+    if let Some(handle) = &request.handle
+        && !is_valid_handle(handle)
+    {
+        return Err(ApiError::bad_request("invalid handle"));
+    }
+
+    match state
+        .store
+        .provision_root(
+            &request.app_id,
+            &request.device_id,
+            request.handle.as_deref(),
+        )
+        .await
+    {
+        Ok(root) => {
+            info!(
+                app_id = %root.app_id,
+                root_id = %root.root_id,
+                device_id = %root.device_id,
+                "provisioned root"
+            );
+            Ok((StatusCode::CREATED, Json(root)))
+        }
+        Err(StoreError::Conflict) => Err(ApiError::handle_taken()),
+        Err(err) => {
+            error!(error = %err, "failed to provision root");
             Err(ApiError::internal())
         }
     }
@@ -685,13 +822,51 @@ async fn create_enrollment(
             ApiError::internal()
         })?;
 
+    let pairing_uri = state
+        .public_url
+        .as_deref()
+        .map(|server| pairing_uri(server, &code.code));
+
     Ok((
         StatusCode::CREATED,
         Json(EnrollmentResponse {
             code: code.code,
             expires_at_ms,
+            pairing_uri,
         }),
     ))
+}
+
+/// Builds the URI a new device scans.
+///
+/// It carries where to go and what to say, and nothing about the root itself —
+/// the code already identifies that, and the server resolves it on redemption.
+/// The content key belongs on the end as a `#k=` fragment, added by the app:
+/// a fragment is never sent to a server, which is the property that lets one
+/// QR code carry both halves of pairing without GESH learning the second.
+fn pairing_uri(server: &str, code: &str) -> String {
+    format!(
+        "gesh://pair?s={}&c={}",
+        percent_encode(server.trim_end_matches('/')),
+        percent_encode(code)
+    )
+}
+
+/// Escapes the characters that would otherwise end a query parameter.
+///
+/// A code is drawn from an alphabet that needs no escaping and a server URL is
+/// the operator's own, so this is a guard against a malformed pairing URI
+/// rather than against hostile input.
+fn percent_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|byte| match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                (byte as char).to_string()
+            }
+            _ => format!("%{byte:02X}"),
+        })
+        .collect()
 }
 
 /// Exchanges a pairing code for the device's own credential.
@@ -714,19 +889,24 @@ async fn redeem_enrollment(
             .throttles
             .enroll_failures
             .record_failure(&attempt.client);
-        warn!(client = %attempt.client, handle = %attempt.handle, "rejected enrollment attempt");
+        warn!(client = %attempt.client, "rejected enrollment attempt");
     };
 
-    let root = match state.store.resolve_handle(&attempt.handle).await {
-        Ok(root) => root,
-        Err(StoreError::NotFound) => {
-            failed();
-            return Err(ApiError::unknown_root());
-        }
-        Err(err) => {
-            error!(error = %err, "failed to resolve handle");
-            return Err(ApiError::internal());
-        }
+    // A handle is only present on the typed-name route. On the scanned route
+    // there is nothing to check against: the code names its own root.
+    let named_root = match &attempt.handle {
+        None => None,
+        Some(handle) => match state.store.resolve_handle(handle).await {
+            Ok(root) => Some(root),
+            Err(StoreError::NotFound) => {
+                failed();
+                return Err(ApiError::unknown_root());
+            }
+            Err(err) => {
+                error!(error = %err, "failed to resolve handle");
+                return Err(ApiError::internal());
+            }
+        },
     };
 
     let enrolled = match state
@@ -747,7 +927,9 @@ async fn redeem_enrollment(
 
     // A code is bound to the root that minted it, so one presented against a
     // different handle is refused rather than silently enrolling elsewhere.
-    if enrolled.app_id != root.app_id || enrolled.root_id != root.root_id {
+    if let Some(root) = named_root
+        && (enrolled.app_id != root.app_id || enrolled.root_id != root.root_id)
+    {
         failed();
         return Err(ApiError::invalid_code());
     }
@@ -961,6 +1143,7 @@ mod tests {
     fn limits() -> Limits {
         Limits {
             enroll_attempts_per_minute: 60,
+            roots_per_minute: 5,
             handle_lookups_per_minute: 60,
             failures_before_backoff: 3,
             max_backoff: Duration::from_secs(300),
@@ -986,6 +1169,8 @@ mod tests {
                 sweep_interval: Duration::from_secs(60),
             },
             enrollment_code_ttl: Duration::from_secs(600),
+            provisioning_secret: None,
+            public_url: None,
             limits,
         };
 
@@ -1004,6 +1189,8 @@ mod tests {
             secrets: Arc::new(secrets),
             store,
             enrollment_code_ttl: config.enrollment_code_ttl,
+            provisioning_secret: config.provisioning_secret.clone().map(Arc::new),
+            public_url: config.public_url.clone().map(Arc::new),
             throttles: Arc::new(Throttles::new(&config.limits)),
             trusted_forwarded_header: config.limits.trusted_forwarded_header.clone(),
         };
@@ -1054,6 +1241,354 @@ mod tests {
         );
 
         request
+    }
+
+    fn post(peer: &str, uri: &str, token: Option<&str>, body: impl Into<Body>) -> Request<Body> {
+        let mut request = from(peer);
+        *request.method_mut() = http::Method::POST;
+        *request.uri_mut() = uri.parse().expect("uri");
+        request.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/json".parse().expect("header value"),
+        );
+
+        if let Some(token) = token {
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("header value"),
+            );
+        }
+
+        *request.body_mut() = body.into();
+
+        request
+    }
+
+    async fn json(response: Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body is readable");
+
+        serde_json::from_slice(&bytes).expect("body is JSON")
+    }
+
+    fn field(value: &serde_json::Value, key: &str) -> String {
+        value[key]
+            .as_str()
+            .unwrap_or_else(|| panic!("{key} is present and a string"))
+            .to_owned()
+    }
+
+    /// Provisions a root the way an app would on first launch.
+    async fn provision(state: &AppState, peer: &str, token: Option<&str>) -> serde_json::Value {
+        let response = send(
+            state,
+            post(
+                peer,
+                "/v1/roots",
+                token,
+                r#"{"appId":"fattern","deviceId":"desktop"}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        json(response).await
+    }
+
+    /// The whole point of self-provisioning, start to finish: an app installs,
+    /// makes its own root, and pairs a second device — with nobody editing a
+    /// file on the server and nobody choosing a secret.
+    #[tokio::test]
+    async fn an_app_provisions_itself_and_pairs_a_second_device() {
+        let (state, _dir) = test_state(limits()).await;
+
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let root_token = field(&root, "root_token");
+        let device_token = field(&root, "device_token");
+
+        // The server chose the root, and the two credentials are distinct.
+        assert_eq!(app_id, "fattern");
+        assert!(root_id.starts_with("root_"));
+        assert_ne!(root_token, device_token);
+
+        // Device one can already sync, with no enrollment step of its own.
+        let mut sync = from("203.0.113.5:44000");
+        *sync.uri_mut() = format!("/v1/sync/{app_id}/{root_id}?after=0&limit=10")
+            .parse()
+            .expect("uri");
+        sync.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {device_token}")
+                .parse()
+                .expect("header value"),
+        );
+        assert_eq!(send(&state, sync).await.status(), StatusCode::OK);
+
+        // It mints a code with its root credential.
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                &format!("/v1/admin/{app_id}/{root_id}/enrollments"),
+                Some(&root_token),
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let code = field(&json(response).await, "code");
+
+        // Device two presents only the code — no handle, no root id, nothing a
+        // person had to read out.
+        let body: &'static str =
+            Box::leak(format!(r#"{{"code":"{code}","deviceId":"phone"}}"#).into_boxed_str());
+        let response = send(&state, post("198.51.100.9:44000", "/v1/enroll", None, body)).await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let enrolled = json(response).await;
+        assert_eq!(field(&enrolled, "root_id"), root_id);
+        assert_eq!(field(&enrolled, "device_id"), "phone");
+        let phone_token = field(&enrolled, "token");
+
+        // And device two can sync, but cannot enroll anyone else.
+        let mut sync = from("198.51.100.9:44000");
+        *sync.uri_mut() = format!("/v1/sync/{app_id}/{root_id}?after=0&limit=10")
+            .parse()
+            .expect("uri");
+        sync.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {phone_token}")
+                .parse()
+                .expect("header value"),
+        );
+        assert_eq!(send(&state, sync).await.status(), StatusCode::OK);
+
+        let response = send(
+            &state,
+            post(
+                "198.51.100.9:44000",
+                &format!("/v1/admin/{app_id}/{root_id}/enrollments"),
+                Some(&phone_token),
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// The source app is the authority, but the credential it syncs with is not.
+    #[tokio::test]
+    async fn the_apps_own_sync_token_cannot_enroll_or_revoke() {
+        let (state, _dir) = test_state(limits()).await;
+
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let device_token = field(&root, "device_token");
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                &format!("/v1/admin/{app_id}/{root_id}/enrollments"),
+                Some(&device_token),
+                "",
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Revocation must never be able to leave a root with no authority over
+    /// itself, so the holder a root credential is filed under is one no request
+    /// can even express.
+    #[tokio::test]
+    async fn the_root_credential_is_not_addressable_as_a_device() {
+        let (state, _dir) = test_state(limits()).await;
+
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let root_token = field(&root, "root_token");
+
+        // It does not appear among the devices the app can manage.
+        let mut request = from("203.0.113.5:44000");
+        *request.uri_mut() = format!("/v1/admin/{app_id}/{root_id}/devices")
+            .parse()
+            .expect("uri");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {root_token}")
+                .parse()
+                .expect("header value"),
+        );
+
+        let response = send(&state, request).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let devices = json(response).await;
+        let listed: Vec<String> = devices
+            .as_array()
+            .expect("a list")
+            .iter()
+            .map(|device| field(device, "device_id"))
+            .collect();
+        assert_eq!(listed, vec!["desktop".to_owned()]);
+
+        // And it cannot be named in a revocation.
+        let mut request = from("203.0.113.5:44000");
+        *request.method_mut() = http::Method::DELETE;
+        *request.uri_mut() = format!("/v1/admin/{app_id}/{root_id}/devices/@root")
+            .parse()
+            .expect("uri");
+        request.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {root_token}")
+                .parse()
+                .expect("header value"),
+        );
+
+        assert_eq!(
+            send(&state, request).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn provisioning_is_rate_limited() {
+        let (state, _dir) = test_state(Limits {
+            roots_per_minute: 2,
+            ..limits()
+        })
+        .await;
+
+        for _ in 0..2 {
+            provision(&state, "203.0.113.5:44000", None).await;
+        }
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                "/v1/roots",
+                None,
+                r#"{"appId":"fattern","deviceId":"desktop"}"#,
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
+
+    #[tokio::test]
+    async fn a_provisioning_secret_closes_the_door() {
+        let (mut state, _dir) = test_state(limits()).await;
+        state.provisioning_secret = Some(Arc::new("operator-secret".to_owned()));
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                "/v1/roots",
+                None,
+                r#"{"appId":"fattern","deviceId":"desktop"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                "/v1/roots",
+                Some("wrong-secret"),
+                r#"{"appId":"fattern","deviceId":"desktop"}"#,
+            ),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        provision(&state, "203.0.113.5:44000", Some("operator-secret")).await;
+    }
+
+    #[tokio::test]
+    async fn a_pairing_uri_is_offered_once_the_server_knows_its_address() {
+        let (mut state, _dir) = test_state(limits()).await;
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let root_token = field(&root, "root_token");
+
+        let enrollments = format!("/v1/admin/{app_id}/{root_id}/enrollments");
+        let response = send(
+            &state,
+            post("203.0.113.5:44000", &enrollments, Some(&root_token), ""),
+        )
+        .await;
+        assert!(json(response).await["pairing_uri"].is_null());
+
+        state.public_url = Some(Arc::new("https://sync.example.com/".to_owned()));
+        let response = send(
+            &state,
+            post("203.0.113.5:44000", &enrollments, Some(&root_token), ""),
+        )
+        .await;
+
+        let body = json(response).await;
+        let uri = field(&body, "pairing_uri");
+        let code = field(&body, "code");
+
+        // Where to go and what to say, and nothing that identifies the root.
+        assert_eq!(
+            uri,
+            format!(
+                "gesh://pair?s=https%3A%2F%2Fsync.example.com&c={}",
+                percent_encode(&code)
+            )
+        );
+        assert!(!uri.contains(&root_id));
+    }
+
+    #[tokio::test]
+    async fn a_code_redeemed_against_the_wrong_handle_is_refused() {
+        let (state, _dir) = test_state(limits()).await;
+
+        // "madsen-home" belongs to the fixture's root, not to this new one.
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let root_token = field(&root, "root_token");
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                &format!("/v1/admin/{app_id}/{root_id}/enrollments"),
+                Some(&root_token),
+                "",
+            ),
+        )
+        .await;
+        let code = field(&json(response).await, "code");
+
+        let body: &'static str =
+            Box::leak(format!(r#"{{"code":"{code}","deviceId":"phone"}}"#).into_boxed_str());
+        let response = send(
+            &state,
+            post(
+                "198.51.100.9:44000",
+                "/v1/roots/madsen-home/enroll",
+                None,
+                body,
+            ),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
