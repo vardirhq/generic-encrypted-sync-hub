@@ -28,7 +28,7 @@ impl Config {
             .unwrap_or_else(|_| PathBuf::from("data/secrets.json"));
 
         let database_url =
-            env::var("GESH_DATABASE_URL").unwrap_or_else(|_| "sqlite:data/gesh.db".to_string());
+            env::var("GESH_DATABASE_URL").unwrap_or_else(|_| "sqlite://data/gesh.db".to_string());
         let database_options = SqliteConnectOptions::from_str(&database_url)
             .context("GESH_DATABASE_URL must be a valid SQLite URL")?
             .create_if_missing(true)
