@@ -1,0 +1,62 @@
+# A single-node GESH, meant to sit behind your own TLS reverse proxy.
+#
+#   docker compose up -d --build
+#
+# Override the two things that are deployment-specific with a .env file beside
+# this one, or with real environment variables:
+#
+#   GESH_PUBLIC_URL=https://sync.example.com
+#   GESH_DATA_DIR=/srv/gesh/data
+#   GESH_BIND=127.0.0.1:3000
+#
+# The data directory must be writable by uid 10001, which the image runs as:
+#
+#   install -d -m 750 -o 10001 -g 10001 /srv/gesh/data
+
+services:
+  gesh:
+    build: .
+    image: gesh-server:latest
+    restart: unless-stopped
+
+    environment:
+      # 0.0.0.0 *inside the container*, not the 127.0.0.1 default. A process
+      # bound to the container's loopback is unreachable even from the host, so
+      # the default would leave you with a container that never answers. What
+      # keeps this private is the host side of `ports:` below — GESH_BIND
+      # defaults to 127.0.0.1, so nothing is exposed without a proxy in front.
+      GESH_LISTEN_ADDR: 0.0.0.0:3000
+
+      # Both under /data, so one volume holds all durable state.
+      GESH_BLOB_BASE_DIR: /data/blobs
+      GESH_DATABASE_URL: sqlite:///data/gesh.db
+
+      # Required for `pairing_uri` to appear in enrollment responses. Must be
+      # the externally reachable address, not the container's.
+      GESH_PUBLIC_URL: ${GESH_PUBLIC_URL:-}
+
+      # Set to close `POST /v1/roots`, which is otherwise open to anyone who can
+      # reach the port. Enrollment and sync do not use it.
+      GESH_PROVISIONING_SECRET: ${GESH_PROVISIONING_SECRET:-}
+
+      # Every request arrives from the proxy, so without this all clients share
+      # one rate-limit bucket. Only safe while the proxy is the sole route to
+      # the container — unset it if you publish the port publicly.
+      GESH_TRUSTED_FORWARDED_HEADER: ${GESH_TRUSTED_FORWARDED_HEADER:-x-forwarded-for}
+
+      RUST_LOG: ${RUST_LOG:-gesh_server=info}
+
+    ports:
+      - "${GESH_BIND:-127.0.0.1:3000}:3000"
+
+    volumes:
+      # Defaults to ./data to match `cargo run`. Point GESH_DATA_DIR outside the
+      # checkout for a real deployment: a `git clean -fdx` here would otherwise
+      # erase every root credential.
+      - ${GESH_DATA_DIR:-./data}:/data
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
