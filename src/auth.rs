@@ -7,7 +7,7 @@ use subtle::ConstantTimeEq;
 
 use crate::{
     credentials::{split_token, verify_secret},
-    store::{Store, StoreError},
+    store::{CredentialRole, Store, StoreError},
 };
 
 pub type SecretRegistry = HashMap<String, HashMap<String, String>>;
@@ -24,19 +24,32 @@ pub enum Identity {
     Device(String),
 }
 
+/// Loads the legacy secret registry, if there is one.
+///
+/// A registry is no longer how a root comes into existence — an app provisions
+/// its own root and is handed its credentials — so a missing file is the normal
+/// case and not an error. Deployments that already have one keep working.
 pub async fn load_secret_registry(path: &Path) -> Result<SecretRegistry> {
-    let raw = tokio::fs::read_to_string(path)
-        .await
-        .with_context(|| format!("failed to read secret registry at {}", path.display()))?;
+    let raw = match tokio::fs::read_to_string(path).await {
+        Ok(raw) => raw,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SecretRegistry::new());
+        }
+        Err(err) => {
+            return Err(err)
+                .with_context(|| format!("failed to read secret registry at {}", path.display()));
+        }
+    };
 
     serde_json::from_str(&raw).context("secret registry is not valid JSON")
 }
 
 /// Resolves the identity behind a bearer token for one `(appId, rootId)`.
 ///
-/// Device credentials are tried first because they are the credential a paired
-/// device holds; the registry secret remains accepted so an existing deployment
-/// keeps working, and so there is an authority to enroll the first device with.
+/// Stored credentials are tried first: they are what provisioning and pairing
+/// issue, and the only place a root's authority normally lives. The registry is
+/// consulted afterwards so a deployment that predates self-provisioning keeps
+/// working.
 pub async fn authenticate(
     registry: &SecretRegistry,
     store: &Store,
@@ -54,7 +67,10 @@ pub async fn authenticate(
         && credential.root_id == root_id
         && verify_secret(secret, &credential.secret_hash)
     {
-        return Ok(Some(Identity::Device(credential.device_id)));
+        return Ok(Some(match credential.role {
+            CredentialRole::Root => Identity::Root,
+            CredentialRole::Device => Identity::Device(credential.device_id),
+        }));
     }
 
     if is_root_secret(registry, presented, app_id, root_id) {
@@ -62,6 +78,18 @@ pub async fn authenticate(
     }
 
     Ok(None)
+}
+
+/// Whether a request presents a bearer token matching `expected`.
+///
+/// Used for the server-wide provisioning secret, which is not tied to any root
+/// and so cannot go through [`authenticate`].
+pub fn presents_secret(headers: &HeaderMap, expected: &str) -> bool {
+    let Some(presented) = bearer_token(headers) else {
+        return false;
+    };
+
+    constant_time_secret_eq(Some(expected), presented)
 }
 
 fn is_root_secret(registry: &SecretRegistry, presented: &str, app_id: &str, root_id: &str) -> bool {
