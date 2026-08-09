@@ -1,5 +1,4 @@
 /target
-Cargo.lock
 /data/secrets.json
 /data/blobs
 /data/gesh.db
