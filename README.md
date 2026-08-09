@@ -72,6 +72,37 @@ no secret to write down — an app creates its own root the first time it runs.
 > secrets still authenticate, so an existing install keeps working, but the file
 > is no longer read if it is absent and nothing new should be added to it.
 
+### In a container
+
+No Rust toolchain needed. `compose.yml` builds the image and runs it as an
+unprivileged uid behind whatever TLS reverse proxy you already have:
+
+```bash
+docker compose up -d --build
+curl -fsS http://127.0.0.1:3000/health
+```
+
+Deployment-specific settings go in a `.env` beside it — at minimum
+`GESH_PUBLIC_URL`, so enrollment responses carry a `pairing_uri`, and
+`GESH_DATA_DIR` pointing somewhere outside the checkout, because the default
+`./data` is inside it:
+
+```bash
+GESH_PUBLIC_URL=https://sync.example.com
+GESH_DATA_DIR=/srv/gesh/data
+GESH_PROVISIONING_SECRET=$(openssl rand -base64 33)
+```
+
+That directory must be writable by the uid the image runs as:
+
+```bash
+install -d -m 750 -o 10001 -g 10001 /srv/gesh/data
+```
+
+Only the host side of the published port is loopback; inside the container the
+process binds `0.0.0.0`, since a container-loopback bind would be unreachable
+even from the host. Set `GESH_BIND` to change what the host exposes.
+
 ## Pairing devices
 
 The person using the app should never see any of this. No file to edit, no

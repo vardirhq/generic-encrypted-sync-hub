@@ -1,4 +1,7 @@
 /target
+# compose.yml reads deployment settings from here, including
+# GESH_PROVISIONING_SECRET.
+/.env
 /data/secrets.json
 /data/blobs
 /data/gesh.db

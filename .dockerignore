@@ -1,0 +1,10 @@
+# Keep the build context to what the compile actually needs. `data/` matters
+# most: it is where a local `cargo run` leaves its SQLite database and blobs,
+# and shipping those into an image would be a data leak.
+.git
+.github
+target
+data
+*.md
+compose.yml
+.env
