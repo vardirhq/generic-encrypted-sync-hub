@@ -1510,10 +1510,7 @@ mod tests {
                 .expect("header value"),
         );
         *forge.body_mut() = Body::from("forged");
-        assert_eq!(
-            send(&state, forge).await.status(),
-            StatusCode::UNAUTHORIZED
-        );
+        assert_eq!(send(&state, forge).await.status(), StatusCode::UNAUTHORIZED);
 
         let mut ack = from("198.51.100.9:44000");
         *ack.method_mut() = http::Method::PUT;
