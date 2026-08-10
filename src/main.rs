@@ -388,7 +388,11 @@ async fn resolve_caller(parts: &mut Parts, state: &AppState) -> Result<Caller, A
     })
 }
 
-/// A caller cleared to relay events on a root.
+/// A caller cleared to *write* on the sync plane: upload an event under a
+/// device's name, or acknowledge on its behalf.
+///
+/// Reads use [`FeedReader`] instead, because on a read the device in the path
+/// is the event's author rather than the caller.
 struct SyncScope;
 
 impl FromRequestParts<AppState> for SyncScope {
@@ -400,16 +404,44 @@ impl FromRequestParts<AppState> for SyncScope {
     ) -> Result<Self, Self::Rejection> {
         let caller = resolve_caller(parts, state).await?;
 
-        // On the sync plane the device in the path is the device acting, and a
-        // device credential speaks only for itself. Without this, any paired
-        // device could write events under another device's name, or acknowledge
-        // on its behalf and cause data it never received to be erased.
+        // On a write the device in the path is the device acting, and a device
+        // credential speaks only for itself. Without this, any paired device
+        // could write events under another device's name, or acknowledge on its
+        // behalf and cause data it never received to be erased.
         if let (Identity::Device(authenticated), Some(addressed)) =
             (&caller.identity, &caller.device_id)
             && authenticated != addressed
         {
             return Err(ApiError::unauthorized());
         }
+
+        Ok(Self)
+    }
+}
+
+/// A caller cleared to read an event from a root's feed.
+///
+/// Deliberately without [`SyncScope`]'s same-device rule. On `GET
+/// /v1/sync/{app}/{root}/{device}/{event}` the device in the path is the event's
+/// *author*, not the caller, so requiring the two to match would reject the one
+/// request every peer has to make — fetching what another device published. A
+/// feed no peer can read is not a feed, and retention depends on peers reading
+/// and acknowledging each other's events.
+///
+/// This is not a widening of who may reach a root: `resolve_caller` still
+/// demands a credential valid on that exact root, and revocation still applies.
+/// It only stops treating a peer's event as somebody else's private property.
+/// The bytes are sealed with a content key the relay has never seen.
+struct FeedReader;
+
+impl FromRequestParts<AppState> for FeedReader {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        resolve_caller(parts, state).await?;
 
         Ok(Self)
     }
@@ -670,7 +702,7 @@ async fn put_event(
 async fn get_event(
     State(state): State<AppState>,
     Path((app_id, root_id, device_id, event_id)): Path<(String, String, String, String)>,
-    _scope: SyncScope,
+    _scope: FeedReader,
 ) -> Result<Response, ApiError> {
     match state
         .store
@@ -1377,6 +1409,126 @@ mod tests {
         )
         .await;
         assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    /// Reading a peer's event is the whole point of a feed.
+    ///
+    /// The device in a `GET .../{device}/{event}` path is the event's author,
+    /// not the caller, so a same-device rule there rejects the one request every
+    /// peer has to make. Writes stay bound to the caller's own identity.
+    #[tokio::test]
+    async fn a_device_reads_events_published_by_its_peers() {
+        let (state, _dir) = test_state(limits()).await;
+
+        let root = provision(&state, "203.0.113.5:44000", None).await;
+        let app_id = field(&root, "app_id");
+        let root_id = field(&root, "root_id");
+        let root_token = field(&root, "root_token");
+        let desktop_token = field(&root, "device_token");
+
+        let response = send(
+            &state,
+            post(
+                "203.0.113.5:44000",
+                &format!("/v1/admin/{app_id}/{root_id}/enrollments"),
+                Some(&root_token),
+                "",
+            ),
+        )
+        .await;
+        let code = field(&json(response).await, "code");
+        let body: &'static str =
+            Box::leak(format!(r#"{{"code":"{code}","deviceId":"phone"}}"#).into_boxed_str());
+        let response = send(&state, post("198.51.100.9:44000", "/v1/enroll", None, body)).await;
+        let phone_token = field(&json(response).await, "token");
+
+        // The desktop publishes under its own name.
+        let mut upload = from("203.0.113.5:44000");
+        *upload.method_mut() = http::Method::PUT;
+        *upload.uri_mut() = format!("/v1/sync/{app_id}/{root_id}/desktop/evt_1")
+            .parse()
+            .expect("uri");
+        upload.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().expect("header value"),
+        );
+        upload.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {desktop_token}")
+                .parse()
+                .expect("header value"),
+        );
+        *upload.body_mut() = Body::from("sealed");
+        assert_eq!(send(&state, upload).await.status(), StatusCode::CREATED);
+
+        // The phone collects it with its own credential. This is what used to
+        // 401, which aborted the pass before the phone could ack or push.
+        let fetch = |token: String| {
+            let mut request = from("198.51.100.9:44000");
+            *request.uri_mut() = format!("/v1/sync/{app_id}/{root_id}/desktop/evt_1")
+                .parse()
+                .expect("uri");
+            request.headers_mut().insert(
+                header::AUTHORIZATION,
+                format!("Bearer {token}").parse().expect("header value"),
+            );
+            request
+        };
+
+        let response = send(&state, fetch(phone_token.clone())).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("body is readable");
+        assert_eq!(&bytes[..], b"sealed");
+
+        // The root credential still reads, and an outsider still does not.
+        assert_eq!(
+            send(&state, fetch(root_token)).await.status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            send(&state, fetch("not-a-token".to_owned())).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        // Reading a peer's event must not have loosened writing as one. The
+        // phone may not publish under the desktop's name, nor acknowledge for it.
+        let mut forge = from("198.51.100.9:44000");
+        *forge.method_mut() = http::Method::PUT;
+        *forge.uri_mut() = format!("/v1/sync/{app_id}/{root_id}/desktop/evt_2")
+            .parse()
+            .expect("uri");
+        forge.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/octet-stream".parse().expect("header value"),
+        );
+        forge.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {phone_token}")
+                .parse()
+                .expect("header value"),
+        );
+        *forge.body_mut() = Body::from("forged");
+        assert_eq!(send(&state, forge).await.status(), StatusCode::UNAUTHORIZED);
+
+        let mut ack = from("198.51.100.9:44000");
+        *ack.method_mut() = http::Method::PUT;
+        *ack.uri_mut() = format!("/v1/sync/{app_id}/{root_id}/desktop")
+            .parse()
+            .expect("uri");
+        ack.headers_mut().insert(
+            header::CONTENT_TYPE,
+            "application/json".parse().expect("header value"),
+        );
+        ack.headers_mut().insert(
+            header::AUTHORIZATION,
+            format!("Bearer {phone_token}")
+                .parse()
+                .expect("header value"),
+        );
+        *ack.body_mut() = Body::from(r#"{"ackCursor":99}"#);
+        assert_eq!(send(&state, ack).await.status(), StatusCode::UNAUTHORIZED);
     }
 
     /// The source app is the authority, but the credential it syncs with is not.
